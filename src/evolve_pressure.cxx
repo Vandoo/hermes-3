@@ -268,15 +268,15 @@ void EvolvePressure::transform_impl(GuardedOptions& state) {
   // re initialise T guard cells
   T.applyBoundary("neumann");
   // Ion-only diagnostic: 
-  if (identifySpeciesType(name) == SpeciesType::ion) {
-    BoutReal Pmin = min(P, true);  // true = include all processors
-    if (Pmin < 0.0) {
-      // Derive Tmin from raw P so it also reflects the true negative value
-      BoutReal Tmin = min(P / softFloor(N, density_floor), true);
-      output.write("\n[evolve_pressure] WARNING: {:s} P_min = {:e}, T_min = {:e} < 0 at t = {:e}\n",
-                   name, Pmin, Tmin, get<BoutReal>(state["time"]));
-    }
-  }
+  //if (identifySpeciesType(name) == SpeciesType::ion) {
+  //  BoutReal Pmin = min(P, true);  // true = include all processors
+  //  if (Pmin < 0.0) {
+  //    // Derive Tmin from raw P so it also reflects the true negative value
+  //    BoutReal Tmin = min(P / softFloor(N, density_floor), true);
+  //    output.write("\n[evolve_pressure] WARNING: {:s} P_min = {:e}, T_min = {:e} < 0 at t = {:e}\n",
+  //                 name, Pmin, Tmin, get<BoutReal>(state["time"]));
+  //  }
+  //}
 
   set(species["pressure"], Pfloor);
   set(species["temperature"], T);
@@ -317,7 +317,7 @@ void EvolvePressure::finally(const Options& state) {
       fastest_wave = get<Field3D>(state["fastest_wave"]);
     } else {
       const BoutReal AA = get<BoutReal>(species["AA"]);
-      fastest_wave = sqrt(T / AA);
+      fastest_wave = sqrt(floor(T, 0.0) / AA); // guards can be <0 -> protect the sqrt
     }
 
     if (p_div_v) {
