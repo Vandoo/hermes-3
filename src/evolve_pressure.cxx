@@ -269,15 +269,15 @@ void EvolvePressure::transform(Options& state) {
   // re initialise T guard cells
   T.applyBoundary("neumann");
   // Ion-only diagnostic: 
-  if (identifySpeciesType(name) == SpeciesType::ion) {
-    BoutReal Pmin = min(P, true);  // true = include all processors
-    if (Pmin < 0.0) {
-      // Derive Tmin from raw P so it also reflects the true negative value
-      BoutReal Tmin = min(P / softFloor(N, density_floor), true);
-      output.write("\n[evolve_pressure] WARNING: {:s} P_min = {:e}, T_min = {:e} < 0 at t = {:e}\n",
-                   name, Pmin, Tmin, get<BoutReal>(state["time"]));
-    }
-  }
+  //if (identifySpeciesType(name) == SpeciesType::ion) {
+  //  BoutReal Pmin = min(P, true);  // true = include all processors
+  //  if (Pmin < 0.0) {
+  //    // Derive Tmin from raw P so it also reflects the true negative value
+  //    BoutReal Tmin = min(P / softFloor(N, density_floor), true);
+  //    output.write("\n[evolve_pressure] WARNING: {:s} P_min = {:e}, T_min = {:e} < 0 at t = {:e}\n",
+  //                 name, Pmin, Tmin, get<BoutReal>(state["time"]));
+  //  }
+  //}
 
   set(species["pressure"], Pfloor);
   set(species["temperature"], T);
@@ -321,7 +321,7 @@ void EvolvePressure::finally(const Options& state) {
       fastest_wave = get<Field3D>(state["fastest_wave"]);
     } else {
       BoutReal AA = get<BoutReal>(species["AA"]);
-      fastest_wave = sqrt(T / AA);
+      fastest_wave = sqrt( floor(T, 0.0) / AA); // guards can be <0 -> protect the sqrt
     }
 
     if (p_div_v) {
@@ -506,6 +506,8 @@ void EvolvePressure::finally(const Options& state) {
     // Note: Coefficient is slightly different for electrons (3.16) and ions (3.9)
     kappa_par = kappa_coefficient * Pfloor * tau / AA;
 
+    mesh->communicate(kappa_par);
+
     if (kappa_limit_alpha > 0.0) {
       /*
        * Flux limiter, as used in SOLPS.
@@ -518,6 +520,7 @@ void EvolvePressure::finally(const Options& state) {
        * DOI 10.1002/ctpp.200610001
        */
 
+
       // Spitzer-Harm heat flux
       Field3D q_SH = kappa_par * Grad_par(T);
       // Fix: Guard against NaN from 0 * inf (kappa_par near zero * large Grad_par(T))
@@ -527,7 +530,8 @@ void EvolvePressure::finally(const Options& state) {
         }
       }
       // Free-streaming flux
-      Field3D q_fl = kappa_limit_alpha * N * T * sqrt(T / AA);
+      // guards can be <0 i -> protect the sqrt
+      Field3D q_fl = kappa_limit_alpha * N * T * sqrt( floor(T, 0.0) / AA);
 
       // This results in a harmonic average of the heat fluxes
       kappa_par = kappa_par / (1. + abs(q_SH / softFloor(q_fl, 1e-10)));

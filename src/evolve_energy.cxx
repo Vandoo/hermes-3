@@ -378,6 +378,8 @@ void EvolveEnergy::finally(const Options& state) {
     // Note: Coefficient is slightly different for electrons (3.16) and ions (3.9)
     kappa_par = kappa_coefficient * Pfloor * tau / AA;
 
+    mesh->communicate(kappa_par);
+
     if (kappa_limit_alpha > 0.0) {
       /*
        * Flux limiter, as used in SOLPS.
