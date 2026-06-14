@@ -470,6 +470,32 @@ void Vorticity::transform(Options& state) {
     }
   }
 
+  // Physical y-boundary guard cells of phi are not set by the X-Z Laplacian
+  // solve, by phi_boundary_relax (interior-j only), or by communicate (no
+  // neighbour at a physical boundary). Left unset they are NaN under CHECK>=2
+  // (and uninitialised garbage otherwise), and the ExB advection (XPPM) reads
+  // them -> "ddt(P) non-finite". Fill with a Neumann (zero-gradient) copy from
+  // the last interior y-cell, across the full x extent so the x-guard corners
+  // are covered too (those x-cells at interior-y are already set above).
+  for (int i = 0; i < mesh->LocalNx; ++i) {
+    if (mesh->firstY(i)) {
+      for (int j = mesh->ystart - 1; j >= 0; --j)
+        for (int k = 0; k < mesh->LocalNz; ++k)
+          phi(i, j, k) = phi(i, mesh->ystart, k);
+    }
+    if (mesh->lastY(i)) {
+      for (int j = mesh->yend + 1; j < mesh->LocalNy; ++j)
+        for (int k = 0; k < mesh->LocalNz; ++k)
+          phi(i, j, k) = phi(i, mesh->yend, k);
+    }
+  }
+  // Backstop: guarantee no non-finite value survives into consumers of phi.
+  BOUT_FOR(idx, phi.getRegion("RGN_ALL")) {
+    if (!std::isfinite(phi[idx])) {
+      phi[idx] = 0.0;
+    }
+  }
+
   ddt(Vort) = 0.0;
 
   if (diamagnetic) {
