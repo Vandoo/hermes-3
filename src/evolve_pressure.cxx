@@ -301,9 +301,9 @@ void EvolvePressure::finally(const Options& state) {
 
     const Field3D phi = get<Field3D>(state["fields"]["phi"]);
 
-    //ddt(P) = -Div_n_bxGrad_f_B_XPPM(P, phi, bndry_flux, poloidal_flows, true);
     ddtP_ExB = -Div_n_bxGrad_f_B_XPPM(P, phi, bndry_flux, poloidal_flows, true);
-    ddt(P) += ddtP_ExB;
+    // ExB is the first contribution, so assign (=) to initialise ddt(P).
+    ddt(P) = ddtP_ExB;
   } else {
     ddt(P) = 0.0;
   }

@@ -666,6 +666,12 @@ void Vorticity::transform_impl(GuardedOptions& state) {
     }
     phi = fromFieldAligned(phi_fa);
   }
+  // Backstop: guarantee no non-finite value survives into consumers of phi.
+  BOUT_FOR(idx, phi.getRegion("RGN_ALL")) {
+    if (!std::isfinite(phi[idx])) {
+      phi[idx] = 0.0;
+    }
+  }
 
   ddt(Vort) = 0.0;
 
