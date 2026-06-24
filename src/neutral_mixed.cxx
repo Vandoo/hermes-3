@@ -77,7 +77,10 @@ NeutralMixed::NeutralMixed(const std::string& name, Options& alloptions, Solver*
                      .doc("Enable preconditioning in neutral model?")
                      .withDefault<bool>(false);
   precon_model = options["precon_model"]
-                     .doc("Preconditioner model: 0=default, 1=?, etc.")
+                     .doc("Preconditioner model: 0=default, 1=diagonalise, "
+                          "2=abandoned (debug snippets only), "
+                          "3=clean Schur (10/3 D, recommended), "
+                          "4=single-solve 2lnp-lnn with 10/3 D.")
                      .withDefault<int>(0);
 
   lax_flux = options["lax_flux"]
@@ -916,11 +919,21 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
   static int precon_count = 0;
   precon_count++;
   output << "precon() call count: " << precon_count << "\n";
-  //int precon_model = 4;
-  // new test, 1: linearise to ddt(X),ddt(Y) with Laplace inversion only
-  // new test, 2: ? Schur matrix style, previous version
-  // new test, 3: Schur matrix style, ddt(P) and ddt(N) with Laplace_perp
-  // new test, 4: a small change to the default: logP -> 2logP - logN
+  // precon_model:
+  //   0: original default. Schur block with diagonal (5/3) D (perp ADVECTION
+  //      only) and first matrix using single grad(ln p). Misses conduction =>
+  //      factor-2 short on the p self-diffusion and missing the n->p coupling.
+  //   1: diagonalise the 2x2 (n,p) system into decoupled X,Y diffusion with
+  //      eigenvalues (5 +/- sqrt(10))/3 * D (consistent with calculations.tex
+  //      "Alternative 1").
+  //   2: abandoned (wrong-sign CoefD, not a consistent Schur). Kept only as a
+  //      source of reusable stdout/loop snippets; do not use for production.
+  //   3: clean Schur on the (n,p) system. Diagonal = (10/3) D (advection +
+  //      conduction); cross terms carried as explicit Laplacians
+  //      (-5/3 D T Laplace(dN), -D/T Laplace(dP)). This is the corrected,
+  //      consistent reference (see precon_check.tex, option b).
+  //   4: single-solve variant of the default with ln p -> 2 ln p - ln n and the
+  //      corrected (10/3) D diagonal (see precon_check.tex, option a).
   //
   if (precon_model == 0) {
       // First matrix
@@ -1011,6 +1024,10 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
       //}
   }
   else if (precon_model == 2) {
+      // NOTE: abandoned experiment - the Pn solve below has a wrong-sign CoefD
+      // (+gamma*5/3*DnTn) and the structure is not a consistent Schur
+      // factorisation. Kept only for the stdout/loop snippets (reusable for
+      // debugging other branches). Do not use for production preconditioning.
       // First matrix
       //Field3D Tnlim = softFloor(Tn, temperature_floor);
       Field3D DnTn = Dnn * Tnlim;
@@ -1119,12 +1136,15 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
       // d Laplace_perp(x) + a x + (1/c1)Grad(c2) dot Grad_perp(x) = b
       //Field3D Tnlim = softFloor(Tn, temperature_floor);
       Field3D DnTn = Dnn * Tnlim;
-      Field3D Dn_Tn = Dnn / Tnlim;
 
       inv->setCoefA(1 - (5./3 * gamma)* FV::Div_a_Grad_perp(DnTn, diff_2lnPn_lnNn));
       inv->setCoefC1(-1. / ((5./3 * gamma) * DnTn));
       inv->setCoefC2(diff_2lnPn_lnNn);
-      inv->setCoefD(-gamma * Dn_Tn);
+      // Corrected diagonal: the pressure self-diffusion coefficient is the full
+      // (10/3) Dnn (perp advection + conduction), not B = Dnn/Tnlim. The previous
+      // -gamma*Dn_Tn came from mis-expanding the Schur complement S = M33 - LU as
+      // the product (1-L)(1-U), which dropped the dominant (10/3) D diagonal.
+      inv->setCoefD(-gamma * (10./3) * Dnn);
 
       ddt(Pn) = inv->solve(ddt(Pn));
       mesh->communicate(ddt(Pn));
