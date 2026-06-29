@@ -16,11 +16,23 @@ using bout::globals::mesh;
 
 namespace {
   /// Adaptive source term to prevent variable dropping below a floor value.
+  ///
+  /// Smooth (differentiable) turn-on. Far from the floor this equals the
+  /// original ramp  max(lowvalue - f, 0) / scalefactor  (full push for
+  /// f << lowvalue, zero for f >> lowvalue), but it transitions through
+  /// f = lowvalue with a softplus so the source has a CONTINUOUS derivative.
+  /// The original min()/ramp form has a kink at the floor whose derivative
+  /// jump corrupts CVODE's difference-quotient Newton-Krylov Jacobian when
+  /// many cells sit at the floor -> nonlinear-convergence-failure collapse.
+  /// Transition width is a fraction of the floor value.
   void add_low_sourceterm(Field3D& result, const Field3D& f,
                         const BoutReal lowvalue, const BoutReal scalefactor) {
-    const BoutReal inv_scale = -1.0 / scalefactor;
+    const BoutReal width = 0.3 * lowvalue; // smoothing width (fraction of floor)
     BOUT_FOR(i, f.getRegion("RGN_NOBNDRY")) {
-      result[i] += std::min(f[i] - lowvalue, 0.0) * inv_scale;
+      const BoutReal x = (lowvalue - f[i]) / width;
+      // numerically-stable softplus: ln(1 + e^x) = max(x,0) + ln(1 + e^{-|x|})
+      const BoutReal sp = std::max(x, 0.0) + std::log1p(std::exp(-std::abs(x)));
+      result[i] += (width / scalefactor) * sp;
     }
   }
 }
