@@ -61,8 +61,8 @@ private:
   bool neutral_viscosity; ///< include viscosity?
   bool neutral_conduction; ///< Include heat conduction?
   bool evolve_momentum; ///< Evolve parallel momentum?
-  bool evolve_pressure; ///< Evolve pressure equation? (false when passive_momentum=true)
-  bool passive_momentum; ///< only evolve density, passive NVn and Tn=Ti
+  bool evolve_pressure; ///< Evolve pressure equation? (false when parallel_pressure_diffusion=true)
+  bool parallel_pressure_diffusion; ///< only evolve density, passive NVn and Tn=Ti
   std::string temperature_from;
   
   // Collision frequency names — all stored on the neutral species' localstate
