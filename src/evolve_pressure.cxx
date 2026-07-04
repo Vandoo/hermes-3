@@ -95,10 +95,6 @@ EvolvePressure::EvolvePressure(std::string name, Options& alloptions, Solver* so
                            .doc("Timescale for low_p_source term [normalised]. Smaller = more aggressive.")
                            .withDefault<BoutReal>(1e-1);
 
-  conduction_collisions_mode = options["conduction_collisions_mode"]
-      .doc("Can be multispecies: all collisions, or braginskii: self collisions and ie")
-      .withDefault<std::string>("multispecies");
-
   if (evolve_log) {
     // Evolve logarithm of pressure
     solver->add(logP, std::string("logP") + name);
