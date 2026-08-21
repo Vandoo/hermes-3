@@ -52,7 +52,7 @@ namespace {
 }
 
 EvolveDensity::EvolveDensity(std::string name, Options& alloptions, Solver* solver)
-    : Component({readWrite("species:{name}:{outputs}")}), name(name) {
+    : NamedComponent(name, {readWrite("species:{name}:{outputs}")}), name(name) {
 
   auto& options = alloptions[name];
 
