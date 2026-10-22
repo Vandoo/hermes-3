@@ -298,14 +298,15 @@ NeutralMixed::NeutralMixed(const std::string& name, Options& alloptions, Solver*
                "3: Schur complement, diagonal and Laplacian cross terms only. "
                "4: Schur complement of the full frozen-collisionality Jacobian. "
                "5: as 3, with the Schur complement factorised into two solves. "
-               "6: as 5, with the cross terms in flux form FV::Div_a_Grad_perp.")
+               "6: as 5, with the cross terms in flux form FV::Div_a_Grad_perp. "
+               "7: as 3, with the old \"-\" sign in step 3 and the momentum coupling.")
           .withDefault<int>(0);
 
   if (precondition) {
     if (precon_model != -1 and precon_model != 0 and precon_model != 1
         and precon_model != 3 and precon_model != 4 and precon_model != 5
-        and precon_model != 6) {
-      throw BoutException("{:s}: precon_model must be -1, 0, 1, 3, 4, 5 or 6", name);
+        and precon_model != 6 and precon_model != 7) {
+      throw BoutException("{:s}: precon_model must be -1, 0, 1, 3, 4, 5, 6 or 7", name);
     }
     if (precon_model == 4 and !(neutral_conduction and combined_limiters)) {
       throw BoutException("{:s}: precon_model = 4 assumes kappa_n = (5/2) Dnn Nn, so "
@@ -1589,8 +1590,10 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     ddt(Nn).applyBoundary("dirichlet");
     ddt(Pn).applyBoundary("dirichlet");
 
-  } else if (precon_model == 3) {
-    // Diagonal and Laplacian cross terms only, frozen Dnn, K, Tn
+  } else if (precon_model == 3 or precon_model == 7) {
+    // Diagonal and Laplacian cross terms only, frozen Dnn, K, Tn.
+    // Model 7 keeps the "-" sign of the original model 3 (86e4ead6) in step 3,
+    // to measure the effect of the sign alone
 
     mesh->communicate(ddt(Nn));
     ddt(Nn).applyBoundary("dirichlet");
@@ -1609,7 +1612,11 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     ddt(Pn).applyBoundary("dirichlet");
 
     // Step 3
-    ddt(Nn) += gamma * (Dnn / Tnlim) * Laplace_perp(ddt(Pn));
+    if (precon_model == 7) {
+      ddt(Nn) -= gamma * (Dnn / Tnlim) * Laplace_perp(ddt(Pn));
+    } else {
+      ddt(Nn) += gamma * (Dnn / Tnlim) * Laplace_perp(ddt(Pn));
+    }
 
   } else if (precon_model == 5 or precon_model == 6) {
     // As model 3, but keeping the gamma^2 term in the Schur complement:
@@ -1689,7 +1696,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
 
   // Momentum is passive: n v changes with p through the same advection as n
   if (evolve_momentum) {
-    if (precon_model == -1) {
+    if (precon_model == -1 or precon_model == 7) {
       ddt(NVn) -= gamma * FV::Div_a_Grad_perp(DnnNVn / Pnlim, ddt(Pn));
     } else {
       ddt(NVn) += gamma * FV::Div_a_Grad_perp(DnnNVn / Pnlim, ddt(Pn));
