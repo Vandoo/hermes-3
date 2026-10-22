@@ -1545,7 +1545,13 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     // so mu+- = (5 +- sqrt(10)) / 3 for combined limiters. This inverts the
     // whole 2x2 block, including the gamma^2 cross term, but drops grad(T).
 
-    const Field3D k = K / Dnn;
+    // k = 5/2 for combined limiters; avoid 0/0 where Dnn is zero in guard cells
+    Field3D k = zeroFrom(Dnn);
+    if (neutral_conduction) {
+      BOUT_FOR(i, k.getRegion("RGN_ALL")) {
+        k[i] = (Dnn[i] > 0.0) ? K[i] / Dnn[i] : 2.5;
+      }
+    }
     const Field3D s = 5. / 3 + (2. / 3) * k;
     const Field3D root = sqrt(s * s - (8. / 3) * k); // > 0 for any k
     const Field3D mu_plus = 0.5 * (s + root);
