@@ -290,11 +290,37 @@ NeutralMixed::NeutralMixed(const std::string& name, Options& alloptions, Solver*
                                        "excl. IZ, or afn: CX, IZ and NN collisions")
                                   .withDefault<std::string>("afn");
 
+  precon_model =
+      options["precon_model"]
+          .doc("Neutral preconditioner. -1: original (uncorrected) form. "
+               "0: original structure with conduction and sign corrections. "
+               "1: diagonalise the (n, p) system into two decoupled diffusions. "
+               "3: Schur complement, diagonal and Laplacian cross terms only. "
+               "4: Schur complement of the full frozen-collisionality Jacobian.")
+          .withDefault<int>(0);
+
   if (precondition) {
+    if (precon_model != -1 and precon_model != 0 and precon_model != 1
+        and precon_model != 3 and precon_model != 4) {
+      throw BoutException("{:s}: precon_model must be -1, 0, 1, 3 or 4", name);
+    }
+    if (precon_model == 4 and !(neutral_conduction and combined_limiters)) {
+      throw BoutException("{:s}: precon_model = 4 assumes kappa_n = (5/2) Dnn Nn, so "
+                          "needs neutral_conduction = true and combined_limiters = true",
+                          name);
+    }
+
     inv = Laplacian::create(&options["precon_laplace"]);
 
     inv->setInnerBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
     inv->setOuterBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
+
+    if (precon_model == 1) {
+      inv2 = Laplacian::create(&options["precon_laplace"]);
+
+      inv2->setInnerBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
+      inv2->setOuterBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
+    }
   }
 
   // Optionally output time derivatives
@@ -523,7 +549,7 @@ void NeutralMixed::finally(const Options& state) {
   // Nnlim Used where division by neutral density is needed
   Nnlim = softFloor(Nn, density_floor);
   // Tnlim used where positivity of Tn is required
-  const Field3D Tnlim = softFloor(Tn, temperature_floor);
+  Tnlim = softFloor(Tn, temperature_floor);
   // Pnlim used where positivity of Pn is required
   Pnlim = softFloor(Pn, pressure_floor);
   logPnlim = log(Pnlim);
@@ -1431,41 +1457,183 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     return;
   }
 
-  // First matrix
-  //   ( I   0)
-  //   (-LE  I)
-
-  Field3D DTdtN = Dnn * Tn * ddt(Nn);
-  mesh->communicate(DTdtN);
-  DTdtN.applyBoundary("dirichlet");
-
-  ddt(Pn) -= (gamma * 5. / 3) * FV::Div_a_Grad_perp(DTdtN, logPnlim);
-
-  // Second matrix: Invert Pshur
-  //   (E^-1   0  )
-  //   ( 0    P^-1)
+  // Approximate inverse of M = I - gamma J for the perpendicular (n, p) block,
+  // with frozen coefficients. With beta = Dnn Nn / Pn = Dnn / Tn the linearised
+  // perpendicular terms are
   //
-  // d Laplace_perp(x) + a x + (1/c1)Grad(c2) dot Grad_perp(x) = b
-  inv->setCoefA(1 - gamma * FV::Div_a_Grad_perp(Dnn, logPnlim));
-  inv->setCoefC1(-1. / ((gamma * 5. / 3) * Dnn));
-  inv->setCoefC2(logPnlim);
-  inv->setCoefD((-gamma * 5. / 3) * Dnn);
+  //   J_np = Div(beta Grad_perp .)                            p -> n
+  //   J_pp = (5/3) Div(Dnn Grad_perp .) + (2/3) Div(K Grad_perp .) + ...
+  //   J_pn = -(2/3) Div(K Tn Grad_perp .) + ...                n -> p
+  //
+  // where K = kappa_n_perp / Nn is the conduction part (K = (5/2) Dnn when the
+  // limiters are combined, so the p self-diffusion is (10/3) Dnn). The block
+  // inverse (BOUT++ manual, "Preconditioning") is
+  //
+  //   1. p <- p + gamma J_pn n
+  //   2. p <- (I - gamma J_pp)^-1 p
+  //   3. n <- n + gamma J_np p
+  //
+  // dropping the O(gamma^2) term J_pn J_np in the Schur complement. Step 3 is
+  // "+": precon_model = -1 keeps the original "-" for comparison.
 
-  // inv->setInnerBoundaryFlags(INVERT_DC_GRAD);
-  // inv->setOuterBoundaryFlags(INVERT_DC_GRAD);
+  // Conduction contribution to the perpendicular p diffusion
+  const Field3D K = neutral_conduction ? kappa_n_perp / Nnlim : zeroFrom(Dnn);
+  // Total p self-diffusion coefficient, (10/3) Dnn for combined limiters
+  const Field3D Dp = (5. / 3) * Dnn + (2. / 3) * K;
 
-  ddt(Pn) = inv->solve(ddt(Pn));
-  mesh->communicate(ddt(Pn));
-  ddt(Pn).applyBoundary("dirichlet");
+  if (precon_model == -1) {
+    // Original form: advection only, single grad(ln p), "-" in step 3
 
-  // Third matrix: update Nn and NVn equations
-  // ( I   E^-1U )
-  // ( 0     I   )
+    Field3D DTdtN = Dnn * Tn * ddt(Nn);
+    mesh->communicate(DTdtN);
+    DTdtN.applyBoundary("dirichlet");
 
-  ddt(Nn) -= gamma * FV::Div_a_Grad_perp(DnnNn / Pnlim, ddt(Pn));
+    ddt(Pn) -= (gamma * 5. / 3) * FV::Div_a_Grad_perp(DTdtN, logPnlim);
 
+    // d Laplace_perp(x) + a x + (1/c1)Grad(c2) dot Grad_perp(x) = b
+    inv->setCoefA(1 - gamma * FV::Div_a_Grad_perp(Dnn, logPnlim));
+    inv->setCoefC1(-1. / ((gamma * 5. / 3) * Dnn));
+    inv->setCoefC2(logPnlim);
+    inv->setCoefD((-gamma * 5. / 3) * Dnn);
+
+    ddt(Pn) = inv->solve(ddt(Pn));
+    mesh->communicate(ddt(Pn));
+    ddt(Pn).applyBoundary("dirichlet");
+
+    ddt(Nn) -= gamma * FV::Div_a_Grad_perp(DnnNn / Pnlim, ddt(Pn));
+
+  } else if (precon_model == 0) {
+    // Original structure with the corrections: conduction in the diagonal and
+    // in step 1, 5/3 on the advective coefficient in A, "+" in step 3.
+    // The grad(ln p) terms are the advective first-derivative terms only.
+
+    mesh->communicate(ddt(Nn));
+    ddt(Nn).applyBoundary("dirichlet");
+
+    // Step 1, advection: n changes T at fixed p, -(5/3) Div(Dnn Tn dn Grad(ln p))
+    Field3D DTdtN = Dnn * Tn * ddt(Nn);
+    mesh->communicate(DTdtN);
+    DTdtN.applyBoundary("dirichlet");
+
+    ddt(Pn) -= (gamma * 5. / 3) * FV::Div_a_Grad_perp(DTdtN, logPnlim);
+
+    // Step 1, conduction: -(2/3) Div(K Tn Grad_perp(dn))
+    if (neutral_conduction) {
+      ddt(Pn) -= gamma * FV::Div_a_Grad_perp((2. / 3) * K * Tnlim, ddt(Nn));
+    }
+
+    // Step 2
+    // d Laplace_perp(x) + a x + (1/c1)Grad(c2) dot Grad_perp(x) = b
+    inv->setCoefA(1 - (gamma * 5. / 3) * FV::Div_a_Grad_perp(Dnn, logPnlim));
+    inv->setCoefC1(-1. / ((gamma * 5. / 3) * Dnn));
+    inv->setCoefC2(logPnlim);
+    inv->setCoefD(-gamma * Dp);
+
+    ddt(Pn) = inv->solve(ddt(Pn));
+    mesh->communicate(ddt(Pn));
+    ddt(Pn).applyBoundary("dirichlet");
+
+    // Step 3
+    ddt(Nn) += gamma * FV::Div_a_Grad_perp(DnnNn / Pnlim, ddt(Pn));
+
+  } else if (precon_model == 1) {
+    // Diagonalise the frozen-coefficient system
+    //   d/dt (n, p) = [[0, Dnn/Tn], [-(2/3) K Tn, Dp]] Laplace_perp (n, p)
+    // into two decoupled diffusions X, Y with n = X + Y, p = e+ X + e- Y.
+    // Eigenvalues are mu+- Dnn, eigenvectors e+- = mu+- Tn. With k = K / Dnn
+    //   mu+- = (s +- sqrt(s^2 - (8/3) k)) / 2,   s = 5/3 + (2/3) k
+    // so mu+- = (5 +- sqrt(10)) / 3 for combined limiters. This inverts the
+    // whole 2x2 block, including the gamma^2 cross term, but drops grad(T).
+
+    const Field3D k = K / Dnn;
+    const Field3D s = 5. / 3 + (2. / 3) * k;
+    const Field3D root = sqrt(s * s - (8. / 3) * k); // > 0 for any k
+    const Field3D mu_plus = 0.5 * (s + root);
+    const Field3D mu_minus = 0.5 * (s - root);
+    const Field3D e_plus = mu_plus * Tnlim;
+    const Field3D e_minus = mu_minus * Tnlim;
+
+    Field3D X = (ddt(Pn) - e_minus * ddt(Nn)) / (e_plus - e_minus);
+    Field3D Y = (ddt(Pn) - e_plus * ddt(Nn)) / (e_minus - e_plus);
+
+    inv->setCoefA(1.0);
+    inv->setCoefD(-gamma * mu_plus * Dnn);
+    X = inv->solve(X);
+
+    // Without conduction mu- = 0, so Y does not diffuse
+    if (neutral_conduction) {
+      inv2->setCoefA(1.0);
+      inv2->setCoefD(-gamma * mu_minus * Dnn);
+      Y = inv2->solve(Y);
+    }
+
+    ddt(Nn) = X + Y;
+    ddt(Pn) = e_plus * X + e_minus * Y;
+    mesh->communicate(ddt(Nn), ddt(Pn));
+    ddt(Nn).applyBoundary("dirichlet");
+    ddt(Pn).applyBoundary("dirichlet");
+
+  } else if (precon_model == 3) {
+    // Diagonal and Laplacian cross terms only, frozen Dnn, K, Tn
+
+    mesh->communicate(ddt(Nn));
+    ddt(Nn).applyBoundary("dirichlet");
+
+    // Step 1
+    if (neutral_conduction) {
+      ddt(Pn) -= gamma * (2. / 3) * K * Tnlim * Laplace_perp(ddt(Nn));
+    }
+
+    // Step 2
+    inv->setCoefA(1.0);
+    inv->setCoefD(-gamma * Dp);
+
+    ddt(Pn) = inv->solve(ddt(Pn));
+    mesh->communicate(ddt(Pn));
+    ddt(Pn).applyBoundary("dirichlet");
+
+    // Step 3
+    ddt(Nn) += gamma * (Dnn / Tnlim) * Laplace_perp(ddt(Pn));
+
+  } else if (precon_model == 4) {
+    // Full perpendicular Jacobian at frozen beta = 1 / (m nu) = Dnn / Tn.
+    // With kappa_n = (5/2) Dnn Nn advection plus conduction is
+    //   dp/dt = (5/3) Div(beta Grad_perp(p^2 / n)),   dn/dt = Div(beta Grad_perp(p))
+    // so, with delta(p^2/n) = 2 Tn dp - Tn^2 dn,
+    //   J_pp = (10/3) Div(beta Grad_perp(Tn .)),   J_pn = -(5/3) Div(beta Grad_perp(Tn^2 .))
+    // This keeps every first-derivative term that models 0 and 3 drop.
+
+    mesh->communicate(ddt(Nn));
+    ddt(Nn).applyBoundary("dirichlet");
+
+    const Field3D beta = DnnNn / Pnlim;
+
+    // Step 1
+    ddt(Pn) -= (gamma * 5. / 3) * FV::Div_a_Grad_perp(beta, SQ(Tnlim) * ddt(Nn));
+
+    // Step 2: solve for y = Tn dp,
+    //   y / Tn - (10/3) gamma Div(beta Grad_perp(y)) = b
+    // d Laplace_perp(x) + a x + (1/c1)Grad(c2) dot Grad_perp(x) = b
+    inv->setCoefA(1.0 / Tnlim);
+    inv->setCoefC1(-1. / (gamma * 10. / 3));
+    inv->setCoefC2(beta);
+    inv->setCoefD((-gamma * 10. / 3) * beta);
+
+    ddt(Pn) = inv->solve(ddt(Pn)) / Tnlim;
+    mesh->communicate(ddt(Pn));
+    ddt(Pn).applyBoundary("dirichlet");
+
+    // Step 3
+    ddt(Nn) += gamma * FV::Div_a_Grad_perp(beta, ddt(Pn));
+  }
+
+  // Momentum is passive: n v changes with p through the same advection as n
   if (evolve_momentum) {
-    ddt(NVn) -= gamma * FV::Div_a_Grad_perp(DnnNVn / Pnlim, ddt(Pn));
+    if (precon_model == -1) {
+      ddt(NVn) -= gamma * FV::Div_a_Grad_perp(DnnNVn / Pnlim, ddt(Pn));
+    } else {
+      ddt(NVn) += gamma * FV::Div_a_Grad_perp(DnnNVn / Pnlim, ddt(Pn));
+    }
   }
 
   for (auto& i : Nn.getRegion("RGN_NOBNDRY")) {

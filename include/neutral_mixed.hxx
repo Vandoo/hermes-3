@@ -38,6 +38,7 @@ private:
   Field3D Vn;                     ///< Neutral parallel velocity
   Field3D Tn;                     ///< Neutral temperature
   Field3D Nnlim, Pnlim, logPnlim; // Limited in regions of low density
+  Field3D Tnlim;                  ///< Floored temperature, also used in precon
 
   BoutReal AA; ///< Atomic mass (proton = 1)
 
@@ -95,6 +96,8 @@ private:
   bool precon_laplacexy{false};   ///< Use LaplaceXY?
   bool lax_flux;                  ///< Use Lax flux for advection terms
   std::unique_ptr<Laplacian> inv; ///< Laplacian inversion used for preconditioning
+  std::unique_ptr<Laplacian> inv2; ///< Second inversion, precon_model = 1 only
+  int precon_model; ///< Which approximation of the (n, p) Jacobian to invert
 
   Field3D density_source, pressure_source, momentum_source; ///< External input source
   Field3D Sn, Sp, Snv; ///< Particle, pressure and momentum source
