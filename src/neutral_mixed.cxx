@@ -297,13 +297,15 @@ NeutralMixed::NeutralMixed(const std::string& name, Options& alloptions, Solver*
                "1: diagonalise the (n, p) system into two decoupled diffusions. "
                "3: Schur complement, diagonal and Laplacian cross terms only. "
                "4: Schur complement of the full frozen-collisionality Jacobian. "
-               "5: as 3, with the Schur complement factorised into two solves.")
+               "5: as 3, with the Schur complement factorised into two solves. "
+               "6: as 5, with the cross terms in flux form FV::Div_a_Grad_perp.")
           .withDefault<int>(0);
 
   if (precondition) {
     if (precon_model != -1 and precon_model != 0 and precon_model != 1
-        and precon_model != 3 and precon_model != 4 and precon_model != 5) {
-      throw BoutException("{:s}: precon_model must be -1, 0, 1, 3, 4 or 5", name);
+        and precon_model != 3 and precon_model != 4 and precon_model != 5
+        and precon_model != 6) {
+      throw BoutException("{:s}: precon_model must be -1, 0, 1, 3, 4, 5 or 6", name);
     }
     if (precon_model == 4 and !(neutral_conduction and combined_limiters)) {
       throw BoutException("{:s}: precon_model = 4 assumes kappa_n = (5/2) Dnn Nn, so "
@@ -316,7 +318,7 @@ NeutralMixed::NeutralMixed(const std::string& name, Options& alloptions, Solver*
     inv->setInnerBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
     inv->setOuterBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
 
-    if (precon_model == 1 or precon_model == 5) {
+    if (precon_model == 1 or precon_model == 5 or precon_model == 6) {
       inv2 = Laplacian::create(&options["precon_laplace"]);
 
       inv2->setInnerBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
@@ -1483,12 +1485,12 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
   const Field3D Dp = (5. / 3) * Dnn + (2. / 3) * K;
 
   // Eigenvalues mu+- Dnn of the frozen-coefficient (n, p) system, used by
-  // models 1 and 5. With k = K / Dnn
+  // models 1, 5 and 6. With k = K / Dnn
   //   mu+- = (s +- sqrt(s^2 - (8/3) k)) / 2,   s = 5/3 + (2/3) k
   // so mu+- = (5 +- sqrt(10)) / 3 for combined limiters. mu+ + mu- = Dp / Dnn
   // and mu+ mu- = (2/3) k.
   Field3D mu_plus, mu_minus;
-  if (precon_model == 1 or precon_model == 5) {
+  if (precon_model == 1 or precon_model == 5 or precon_model == 6) {
     // k = 5/2 for combined limiters; avoid 0/0 where Dnn is zero in guard cells
     Field3D k = zeroFrom(Dnn);
     if (neutral_conduction) {
@@ -1609,20 +1611,27 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     // Step 3
     ddt(Nn) += gamma * (Dnn / Tnlim) * Laplace_perp(ddt(Pn));
 
-  } else if (precon_model == 5) {
+  } else if (precon_model == 5 or precon_model == 6) {
     // As model 3, but keeping the gamma^2 term in the Schur complement:
     //   S = I - gamma J_pp - gamma^2 J_pn J_np
     //     = I - gamma Dp Laplace_perp + (2/3) gamma^2 K Dnn Laplace_perp^2
     //     = (I - gamma mu+ Dnn Laplace_perp) (I - gamma mu- Dnn Laplace_perp)
     // for frozen coefficients. For one Fourier mode with x = gamma Dnn k_perp^2,
     // S = 1 + (10/3) x + (5/3) x^2, so the x^2 term dominates for stiff modes.
+    // Model 6 applies the cross terms (steps 1 and 3) in flux form, keeping the
+    // grad(coefficient) terms and the boundary fluxes as the RHS does; model 5
+    // uses coefficient * Laplace_perp, as model 3.
 
     mesh->communicate(ddt(Nn));
     ddt(Nn).applyBoundary("dirichlet");
 
     // Step 1
     if (neutral_conduction) {
-      ddt(Pn) -= gamma * (2. / 3) * K * Tnlim * Laplace_perp(ddt(Nn));
+      if (precon_model == 6) {
+        ddt(Pn) -= gamma * FV::Div_a_Grad_perp((2. / 3) * K * Tnlim, ddt(Nn));
+      } else {
+        ddt(Pn) -= gamma * (2. / 3) * K * Tnlim * Laplace_perp(ddt(Nn));
+      }
     }
 
     // Step 2: invert the two factors of S
@@ -1640,7 +1649,11 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     ddt(Pn).applyBoundary("dirichlet");
 
     // Step 3
-    ddt(Nn) += gamma * (Dnn / Tnlim) * Laplace_perp(ddt(Pn));
+    if (precon_model == 6) {
+      ddt(Nn) += gamma * FV::Div_a_Grad_perp(DnnNn / Pnlim, ddt(Pn));
+    } else {
+      ddt(Nn) += gamma * (Dnn / Tnlim) * Laplace_perp(ddt(Pn));
+    }
 
   } else if (precon_model == 4) {
     // Full perpendicular Jacobian at frozen beta = 1 / (m nu) = Dnn / Tn.
