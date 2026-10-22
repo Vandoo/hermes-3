@@ -296,13 +296,14 @@ NeutralMixed::NeutralMixed(const std::string& name, Options& alloptions, Solver*
                "0: original structure with conduction and sign corrections. "
                "1: diagonalise the (n, p) system into two decoupled diffusions. "
                "3: Schur complement, diagonal and Laplacian cross terms only. "
-               "4: Schur complement of the full frozen-collisionality Jacobian.")
+               "4: Schur complement of the full frozen-collisionality Jacobian. "
+               "5: as 3, with the Schur complement factorised into two solves.")
           .withDefault<int>(0);
 
   if (precondition) {
     if (precon_model != -1 and precon_model != 0 and precon_model != 1
-        and precon_model != 3 and precon_model != 4) {
-      throw BoutException("{:s}: precon_model must be -1, 0, 1, 3 or 4", name);
+        and precon_model != 3 and precon_model != 4 and precon_model != 5) {
+      throw BoutException("{:s}: precon_model must be -1, 0, 1, 3, 4 or 5", name);
     }
     if (precon_model == 4 and !(neutral_conduction and combined_limiters)) {
       throw BoutException("{:s}: precon_model = 4 assumes kappa_n = (5/2) Dnn Nn, so "
@@ -315,7 +316,7 @@ NeutralMixed::NeutralMixed(const std::string& name, Options& alloptions, Solver*
     inv->setInnerBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
     inv->setOuterBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
 
-    if (precon_model == 1) {
+    if (precon_model == 1 or precon_model == 5) {
       inv2 = Laplacian::create(&options["precon_laplace"]);
 
       inv2->setInnerBoundaryFlags(INVERT_DC_GRAD | INVERT_AC_GRAD);
@@ -1481,6 +1482,26 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
   // Total p self-diffusion coefficient, (10/3) Dnn for combined limiters
   const Field3D Dp = (5. / 3) * Dnn + (2. / 3) * K;
 
+  // Eigenvalues mu+- Dnn of the frozen-coefficient (n, p) system, used by
+  // models 1 and 5. With k = K / Dnn
+  //   mu+- = (s +- sqrt(s^2 - (8/3) k)) / 2,   s = 5/3 + (2/3) k
+  // so mu+- = (5 +- sqrt(10)) / 3 for combined limiters. mu+ + mu- = Dp / Dnn
+  // and mu+ mu- = (2/3) k.
+  Field3D mu_plus, mu_minus;
+  if (precon_model == 1 or precon_model == 5) {
+    // k = 5/2 for combined limiters; avoid 0/0 where Dnn is zero in guard cells
+    Field3D k = zeroFrom(Dnn);
+    if (neutral_conduction) {
+      BOUT_FOR(i, k.getRegion("RGN_ALL")) {
+        k[i] = (Dnn[i] > 0.0) ? K[i] / Dnn[i] : 2.5;
+      }
+    }
+    const Field3D s = 5. / 3 + (2. / 3) * k;
+    const Field3D root = sqrt(s * s - (8. / 3) * k); // > 0 for any k
+    mu_plus = 0.5 * (s + root);
+    mu_minus = 0.5 * (s - root);
+  }
+
   if (precon_model == -1) {
     // Original form: advection only, single grad(ln p), "-" in step 3
 
@@ -1540,22 +1561,9 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     // Diagonalise the frozen-coefficient system
     //   d/dt (n, p) = [[0, Dnn/Tn], [-(2/3) K Tn, Dp]] Laplace_perp (n, p)
     // into two decoupled diffusions X, Y with n = X + Y, p = e+ X + e- Y.
-    // Eigenvalues are mu+- Dnn, eigenvectors e+- = mu+- Tn. With k = K / Dnn
-    //   mu+- = (s +- sqrt(s^2 - (8/3) k)) / 2,   s = 5/3 + (2/3) k
-    // so mu+- = (5 +- sqrt(10)) / 3 for combined limiters. This inverts the
+    // Eigenvalues are mu+- Dnn, eigenvectors e+- = mu+- Tn. This inverts the
     // whole 2x2 block, including the gamma^2 cross term, but drops grad(T).
 
-    // k = 5/2 for combined limiters; avoid 0/0 where Dnn is zero in guard cells
-    Field3D k = zeroFrom(Dnn);
-    if (neutral_conduction) {
-      BOUT_FOR(i, k.getRegion("RGN_ALL")) {
-        k[i] = (Dnn[i] > 0.0) ? K[i] / Dnn[i] : 2.5;
-      }
-    }
-    const Field3D s = 5. / 3 + (2. / 3) * k;
-    const Field3D root = sqrt(s * s - (8. / 3) * k); // > 0 for any k
-    const Field3D mu_plus = 0.5 * (s + root);
-    const Field3D mu_minus = 0.5 * (s - root);
     const Field3D e_plus = mu_plus * Tnlim;
     const Field3D e_minus = mu_minus * Tnlim;
 
@@ -1595,6 +1603,39 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     inv->setCoefD(-gamma * Dp);
 
     ddt(Pn) = inv->solve(ddt(Pn));
+    mesh->communicate(ddt(Pn));
+    ddt(Pn).applyBoundary("dirichlet");
+
+    // Step 3
+    ddt(Nn) += gamma * (Dnn / Tnlim) * Laplace_perp(ddt(Pn));
+
+  } else if (precon_model == 5) {
+    // As model 3, but keeping the gamma^2 term in the Schur complement:
+    //   S = I - gamma J_pp - gamma^2 J_pn J_np
+    //     = I - gamma Dp Laplace_perp + (2/3) gamma^2 K Dnn Laplace_perp^2
+    //     = (I - gamma mu+ Dnn Laplace_perp) (I - gamma mu- Dnn Laplace_perp)
+    // for frozen coefficients. For one Fourier mode with x = gamma Dnn k_perp^2,
+    // S = 1 + (10/3) x + (5/3) x^2, so the x^2 term dominates for stiff modes.
+
+    mesh->communicate(ddt(Nn));
+    ddt(Nn).applyBoundary("dirichlet");
+
+    // Step 1
+    if (neutral_conduction) {
+      ddt(Pn) -= gamma * (2. / 3) * K * Tnlim * Laplace_perp(ddt(Nn));
+    }
+
+    // Step 2: invert the two factors of S
+    inv->setCoefA(1.0);
+    inv->setCoefD(-gamma * mu_plus * Dnn);
+    ddt(Pn) = inv->solve(ddt(Pn));
+
+    // Without conduction mu- = 0 and S has a single factor
+    if (neutral_conduction) {
+      inv2->setCoefA(1.0);
+      inv2->setCoefD(-gamma * mu_minus * Dnn);
+      ddt(Pn) = inv2->solve(ddt(Pn));
+    }
     mesh->communicate(ddt(Pn));
     ddt(Pn).applyBoundary("dirichlet");
 

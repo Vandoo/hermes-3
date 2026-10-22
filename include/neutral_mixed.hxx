@@ -96,7 +96,7 @@ private:
   bool precon_laplacexy{false};   ///< Use LaplaceXY?
   bool lax_flux;                  ///< Use Lax flux for advection terms
   std::unique_ptr<Laplacian> inv; ///< Laplacian inversion used for preconditioning
-  std::unique_ptr<Laplacian> inv2; ///< Second inversion, precon_model = 1 only
+  std::unique_ptr<Laplacian> inv2; ///< Second inversion, precon_model = 1 or 5
   int precon_model; ///< Which approximation of the (n, p) Jacobian to invert
 
   Field3D density_source, pressure_source, momentum_source; ///< External input source
