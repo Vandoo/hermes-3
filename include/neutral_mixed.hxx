@@ -98,6 +98,7 @@ private:
   std::unique_ptr<Laplacian> inv; ///< Laplacian inversion used for preconditioning
   std::unique_ptr<Laplacian> inv2; ///< Second inversion, precon_model = 1, 5 or 6
   int precon_model; ///< Which approximation of the (n, p) Jacobian to invert
+  std::string precon_bc; ///< Boundary condition on the precon perturbations
 
   Field3D density_source, pressure_source, momentum_source; ///< External input source
   Field3D Sn, Sp, Snv; ///< Particle, pressure and momentum source

@@ -299,14 +299,27 @@ NeutralMixed::NeutralMixed(const std::string& name, Options& alloptions, Solver*
                "4: Schur complement of the full frozen-collisionality Jacobian. "
                "5: as 3, with the Schur complement factorised into two solves. "
                "6: as 5, with the cross terms in flux form FV::Div_a_Grad_perp. "
-               "7: as 3, with the old \"-\" sign in step 3 and the momentum coupling.")
+               "7: as 3, with the old \"-\" sign in step 3 and the momentum coupling. "
+               "8: structure of -1 with (10/3) Dnn and \"+\" in step 3 (D. Power, "
+               "neutrals_bugfixes 3fb34090).")
           .withDefault<int>(0);
+
+  precon_bc = options["precon_bc"]
+                  .doc("Boundary condition on the perturbations in the preconditioner, "
+                       "neumann or dirichlet. Should match the BCs on Nn and Pn. "
+                       "precon_model = -1 always uses dirichlet, as master.")
+                  .withDefault<std::string>("neumann");
 
   if (precondition) {
     if (precon_model != -1 and precon_model != 0 and precon_model != 1
         and precon_model != 3 and precon_model != 4 and precon_model != 5
-        and precon_model != 6 and precon_model != 7) {
-      throw BoutException("{:s}: precon_model must be -1, 0, 1, 3, 4, 5, 6 or 7", name);
+        and precon_model != 6 and precon_model != 7 and precon_model != 8) {
+      throw BoutException("{:s}: precon_model must be -1, 0, 1, 3, 4, 5, 6, 7 or 8",
+                          name);
+    }
+    if (precon_bc != "neumann" and precon_bc != "dirichlet") {
+      throw BoutException("{:s}: precon_bc must be neumann or dirichlet, not {:s}", name,
+                          precon_bc);
     }
     if (precon_model == 4 and !(neutral_conduction and combined_limiters)) {
       throw BoutException("{:s}: precon_model = 4 assumes kappa_n = (5/2) Dnn Nn, so "
@@ -1480,8 +1493,11 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
   // dropping the O(gamma^2) term J_pn J_np in the Schur complement. Step 3 is
   // "+": precon_model = -1 keeps the original "-" for comparison.
 
+  // Boundary condition on the perturbations. Model -1 is kept exactly as master
+  const std::string bc = (precon_model == -1) ? "dirichlet" : precon_bc;
+
   // Conduction contribution to the perpendicular p diffusion
-  const Field3D K = neutral_conduction ? kappa_n_perp / Nnlim : zeroFrom(Dnn);
+  const Field3D K =neutral_conduction ? kappa_n_perp / Nnlim : zeroFrom(Dnn);
   // Total p self-diffusion coefficient, (10/3) Dnn for combined limiters
   const Field3D Dp = (5. / 3) * Dnn + (2. / 3) * K;
 
@@ -1510,7 +1526,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
 
     Field3D DTdtN = Dnn * Tn * ddt(Nn);
     mesh->communicate(DTdtN);
-    DTdtN.applyBoundary("dirichlet");
+    DTdtN.applyBoundary(bc);
 
     ddt(Pn) -= (gamma * 5. / 3) * FV::Div_a_Grad_perp(DTdtN, logPnlim);
 
@@ -1522,7 +1538,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
 
     ddt(Pn) = inv->solve(ddt(Pn));
     mesh->communicate(ddt(Pn));
-    ddt(Pn).applyBoundary("dirichlet");
+    ddt(Pn).applyBoundary(bc);
 
     ddt(Nn) -= gamma * FV::Div_a_Grad_perp(DnnNn / Pnlim, ddt(Pn));
 
@@ -1532,12 +1548,12 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     // The grad(ln p) terms are the advective first-derivative terms only.
 
     mesh->communicate(ddt(Nn));
-    ddt(Nn).applyBoundary("dirichlet");
+    ddt(Nn).applyBoundary(bc);
 
     // Step 1, advection: n changes T at fixed p, -(5/3) Div(Dnn Tn dn Grad(ln p))
     Field3D DTdtN = Dnn * Tn * ddt(Nn);
     mesh->communicate(DTdtN);
-    DTdtN.applyBoundary("dirichlet");
+    DTdtN.applyBoundary(bc);
 
     ddt(Pn) -= (gamma * 5. / 3) * FV::Div_a_Grad_perp(DTdtN, logPnlim);
 
@@ -1555,7 +1571,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
 
     ddt(Pn) = inv->solve(ddt(Pn));
     mesh->communicate(ddt(Pn));
-    ddt(Pn).applyBoundary("dirichlet");
+    ddt(Pn).applyBoundary(bc);
 
     // Step 3
     ddt(Nn) += gamma * FV::Div_a_Grad_perp(DnnNn / Pnlim, ddt(Pn));
@@ -1587,8 +1603,8 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     ddt(Nn) = X + Y;
     ddt(Pn) = e_plus * X + e_minus * Y;
     mesh->communicate(ddt(Nn), ddt(Pn));
-    ddt(Nn).applyBoundary("dirichlet");
-    ddt(Pn).applyBoundary("dirichlet");
+    ddt(Nn).applyBoundary(bc);
+    ddt(Pn).applyBoundary(bc);
 
   } else if (precon_model == 3 or precon_model == 7) {
     // Diagonal and Laplacian cross terms only, frozen Dnn, K, Tn.
@@ -1596,7 +1612,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     // to measure the effect of the sign alone
 
     mesh->communicate(ddt(Nn));
-    ddt(Nn).applyBoundary("dirichlet");
+    ddt(Nn).applyBoundary(bc);
 
     // Step 1
     if (neutral_conduction) {
@@ -1609,7 +1625,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
 
     ddt(Pn) = inv->solve(ddt(Pn));
     mesh->communicate(ddt(Pn));
-    ddt(Pn).applyBoundary("dirichlet");
+    ddt(Pn).applyBoundary(bc);
 
     // Step 3
     if (precon_model == 7) {
@@ -1630,7 +1646,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     // uses coefficient * Laplace_perp, as model 3.
 
     mesh->communicate(ddt(Nn));
-    ddt(Nn).applyBoundary("dirichlet");
+    ddt(Nn).applyBoundary(bc);
 
     // Step 1
     if (neutral_conduction) {
@@ -1653,7 +1669,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
       ddt(Pn) = inv2->solve(ddt(Pn));
     }
     mesh->communicate(ddt(Pn));
-    ddt(Pn).applyBoundary("dirichlet");
+    ddt(Pn).applyBoundary(bc);
 
     // Step 3
     if (precon_model == 6) {
@@ -1671,7 +1687,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     // This keeps every first-derivative term that models 0 and 3 drop.
 
     mesh->communicate(ddt(Nn));
-    ddt(Nn).applyBoundary("dirichlet");
+    ddt(Nn).applyBoundary(bc);
 
     const Field3D beta = DnnNn / Pnlim;
 
@@ -1688,10 +1704,35 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
 
     ddt(Pn) = inv->solve(ddt(Pn)) / Tnlim;
     mesh->communicate(ddt(Pn));
-    ddt(Pn).applyBoundary("dirichlet");
+    ddt(Pn).applyBoundary(bc);
 
     // Step 3
     ddt(Nn) += gamma * FV::Div_a_Grad_perp(beta, ddt(Pn));
+
+  } else if (precon_model == 8) {
+    // D. Power's fix of the original form (Plasdom/hermes-3 neutrals_bugfixes,
+    // 3fb34090): as -1, but (10/3) Dnn in the inversion with conduction and "+"
+    // in step 3. Neumann perturbation BCs there; here set by precon_bc
+
+    const BoutReal schur_factor = neutral_conduction ? 10. / 3 : 5. / 3;
+
+    Field3D DTdtN = Dnn * Tn * ddt(Nn);
+    mesh->communicate(DTdtN);
+    DTdtN.applyBoundary(bc);
+
+    ddt(Pn) -= (gamma * 5. / 3) * FV::Div_a_Grad_perp(DTdtN, logPnlim);
+
+    // d Laplace_perp(x) + a x + (1/c1)Grad(c2) dot Grad_perp(x) = b
+    inv->setCoefA(1 - gamma * FV::Div_a_Grad_perp(Dnn, logPnlim));
+    inv->setCoefC1(-1. / ((gamma * 5. / 3) * Dnn));
+    inv->setCoefC2(logPnlim);
+    inv->setCoefD(-gamma * schur_factor * Dnn);
+
+    ddt(Pn) = inv->solve(ddt(Pn));
+    mesh->communicate(ddt(Pn));
+    ddt(Pn).applyBoundary(bc);
+
+    ddt(Nn) += gamma * FV::Div_a_Grad_perp(DnnNn / Pnlim, ddt(Pn));
   }
 
   // Momentum is passive: n v changes with p through the same advection as n
@@ -1710,7 +1751,7 @@ void NeutralMixed::precon([[maybe_unused]] const Options& state, BoutReal gamma)
     if (!std::isfinite(ddt(Pn)[i])) {
       throw BoutException("Precon ddt(P{}) non-finite at {}\n", name, i);
     }
-    if (!std::isfinite(ddt(NVn)[i])) {
+    if (evolve_momentum and !std::isfinite(ddt(NVn)[i])) {
       throw BoutException("Precon ddt(NV{}) non-finite at {}\n", name, i);
     }
   }
