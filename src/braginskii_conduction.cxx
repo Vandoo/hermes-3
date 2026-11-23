@@ -78,10 +78,17 @@ BoutReal face_flux_unlimited(const Field3D& K, const Field3D& f, const Coordinat
 /// and the face flux is limited as F / (1 + |q_SH| / q_fl), the same harmonic
 /// combination as the cell-centred limiter.
 ///
-/// Why: with the cell-centred limiter, a cold cell next to a hot one has a
-/// small q_fl and a large gradient, so it strongly limits its own conductive
-/// heating. The heat crossing a face is carried by particles coming from the
-/// hot side, so q_fl is evaluated there.
+/// Why: the cell-centred limiter makes kappa vary strongly from cell to cell,
+/// because each cell's limiting factor depends on its own gradient and
+/// temperature. With a shifted metric that kappa is shifted to field-aligned
+/// coordinates (an FFT in z) before the face fluxes are formed, and a spiky
+/// kappa can ring to negative values on some faces; a negative face
+/// conductivity drives heat from the colder cell into the hotter one. Here
+/// only the unlimited K, T and P are shifted, and the limiting factor lies in
+/// (0, 1], so each face flux keeps the sign of the unlimited one. The cap
+/// uses the face's own gradient, and q_fl is that of the side the heat comes
+/// from (cf. the upwind saturated flux of Mignone et al. 2012, ApJS 198, 7,
+/// Appendix A).
 ///
 /// Fluxes through target faces are not included (the sheath removes that
 /// heat separately). As alpha -> infinity the result tends to

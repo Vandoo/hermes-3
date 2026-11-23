@@ -325,10 +325,15 @@ applied to the heat flux through each parallel cell face. :math:`q_{SH}`
 is the unlimited face flux of the selected `conduction_method`, and
 :math:`q_{fl}` is evaluated with the pressure and temperature of the
 hotter of the two cells, since the heat crossing the face is carried by
-particles coming from the hot side. With the cell-centred form, a cold
-cell next to hot ones has a free-streaming flux that is orders of
-magnitude smaller than its neighbours', so it strongly limits its own
-conductive heating. The face form avoids this. For large
+particles coming from the hot side. With the cell-centred form each
+cell's limiting factor depends on its own gradient and temperature, so
+the limited :math:`\kappa_{||}` can vary strongly from cell to cell; with
+a shifted metric it is shifted to field-aligned coordinates (an FFT in
+z) before the face fluxes are formed, and can then become negative on
+some faces, which drives heat from the colder cell into the hotter one.
+The face form shifts only the unlimited :math:`\kappa_{||}`, :math:`T`
+and :math:`P`, and its limiting factor lies between 0 and 1, so each
+face flux keeps the sign of the unlimited one. For large
 :math:`\alpha` both forms tend to the unlimited operator. The face form
 is not implemented for FCI or `use_petsc_operator`. The output
 `kappa_par` is then the cell-centred :math:`\kappa_{||}` multiplied by
