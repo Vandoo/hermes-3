@@ -1,12 +1,16 @@
 #include <string>
 #include <utility>
 
+#include <cmath>
+
 #include <bout/bout_types.hxx>
+#include <bout/constants.hxx>
 #include <bout/region.hxx>
 #include <bout/solver.hxx>
 #include <bout/utils.hxx>
 #include "gtest/gtest.h"
 
+#include "../../include/braginskii_collisions.hxx"
 #include "../../include/braginskii_conduction.hxx"
 #include "fake_mesh_fixture.hxx"
 #include "test_extras.hxx" // FakeMesh
@@ -186,6 +190,110 @@ TEST_F(BraginskiiConductionTest, ConductionCollisionsMode) {
   BOUT_FOR_SERIAL(i, conduction_brag.getRegion("RGN_NOBNDRY")) {
     EXPECT_NE(conduction_brag[i], 0.);
     EXPECT_DOUBLE_EQ(conduction_brag[i], 2 * conduction_multi[i]);
+  }
+}
+
+namespace {
+/// Options for conduction of electrons and one singly charged ion species,
+/// with default kappa coefficients, in the given collisions mode
+Options electronIonOptions(const std::string& mode) {
+  Options opts{{"units",
+                {{"eV", 1.0},
+                 {"meters", 1.0},
+                 {"seconds", 1.0},
+                 {"inv_meters_cubed", 1e19}}}};
+  for (const std::string sp : {"e", "d+"}) {
+    opts[sp]["type"] = "evolve_pressure";
+    opts[sp]["thermal_conduction"] = true;
+    opts[sp]["conduction_collisions_mode"] = mode;
+  }
+  return opts;
+}
+
+/// Electron and deuterium ion state, n = 1e19 m^-3, T = 50 eV
+Options electronIonState() {
+  Options state{{"fastest_wave", 0.}};
+  state["species"]["e"]["AA"] = SI::Me / SI::Mp;
+  state["species"]["e"]["charge"] = -1.;
+  state["species"]["d+"]["AA"] = 2.;
+  state["species"]["d+"]["charge"] = 1.;
+  for (const std::string sp : {"e", "d+"}) {
+    state["species"][sp]["density"] = 1.;
+    state["species"][sp]["temperature"] = 50.;
+    state["species"][sp]["pressure"] = 50.;
+    state["species"][sp]["velocity"] = 0.;
+  }
+  return state;
+}
+} // namespace
+
+TEST_F(BraginskiiConductionTest, ElectronModesAgreeForFitzpatrickRates) {
+  // Hermes-3's e-e rate is nu_ei / sqrt(2) for a singly charged ion (same Coulomb
+  // logarithm, m_e/m_i -> 0). Braginskii mode uses 3.16/sqrt(2) with nu_ee,
+  // multispecies uses 3.16 with nu_ei (e-e is already inside the coefficient), so the
+  // electron conductivities must be identical.
+  const BoutReal nu_ee = 0.7;
+  Options state = electronIonState();
+  state["species"]["e"]["collision_frequencies"]["e_e_coll"] = nu_ee;
+  state["species"]["e"]["collision_frequencies"]["e_d+_coll"] = sqrt(2.) * nu_ee;
+  state["species"]["d+"]["collision_frequencies"]["d+_d+_coll"] = 1.;
+  Options state_brag = state.copy();
+  Options state_multi = state.copy();
+
+  Options opts_brag = electronIonOptions("braginskii");
+  Options opts_multi = electronIonOptions("multispecies");
+  BraginskiiConduction brag("conduction", opts_brag, nullptr);
+  BraginskiiConduction multi("conduction", opts_multi, nullptr);
+  brag.declareAllSpecies({"e", "d+"});
+  multi.declareAllSpecies({"e", "d+"});
+  brag.transform(state_brag);
+  multi.transform(state_multi);
+
+  const Field3D kappa_brag = state_brag["species"]["e"]["kappa_par"];
+  const Field3D kappa_multi = state_multi["species"]["e"]["kappa_par"];
+  BOUT_FOR_SERIAL(i, kappa_brag.getRegion("RGN_NOBNDRY")) {
+    EXPECT_GT(kappa_brag[i], 0.);
+    EXPECT_NEAR(kappa_multi[i], kappa_brag[i], 1e-12 * kappa_brag[i]);
+  }
+}
+
+TEST_F(BraginskiiConductionTest, SingleIonModesAgreeWithBraginskiiCollisions) {
+  // With the rates of the collisions component, braginskii and multispecies modes give
+  // the same conductivity for one singly charged ion species, up to:
+  //  - electrons: the e-e and e-i Coulomb logarithms differ (NRL formulary), here by
+  //    0.8 %
+  //  - ions: multispecies also counts ion-electron collisions, which are slower than
+  //    ion-ion collisions by about sqrt(2 m_e / m_i) (2.2 % for deuterium, Te = Ti)
+  Options collision_opts{{"units",
+                          {{"eV", 1.0},
+                           {"meters", 1.0},
+                           {"seconds", 1.0},
+                           {"inv_meters_cubed", 1e19}}}};
+  BraginskiiCollisions collisions("collisions", collision_opts, nullptr);
+  Options state = electronIonState();
+  collisions.declareAllSpecies(SpeciesInformation({"e"}, {}, {"d+"}, {}));
+  collisions.transform(state);
+  Options state_brag = state.copy();
+  Options state_multi = state.copy();
+
+  Options opts_brag = electronIonOptions("braginskii");
+  Options opts_multi = electronIonOptions("multispecies");
+  BraginskiiConduction brag("conduction", opts_brag, nullptr);
+  BraginskiiConduction multi("conduction", opts_multi, nullptr);
+  brag.declareAllSpecies({"e", "d+"});
+  multi.declareAllSpecies({"e", "d+"});
+  brag.transform(state_brag);
+  multi.transform(state_multi);
+
+  const Field3D ke_brag = state_brag["species"]["e"]["kappa_par"];
+  const Field3D ke_multi = state_multi["species"]["e"]["kappa_par"];
+  const Field3D ki_brag = state_brag["species"]["d+"]["kappa_par"];
+  const Field3D ki_multi = state_multi["species"]["d+"]["kappa_par"];
+  BOUT_FOR_SERIAL(i, ke_brag.getRegion("RGN_NOBNDRY")) {
+    EXPECT_GT(ke_brag[i], 0.);
+    EXPECT_NEAR(ke_multi[i] / ke_brag[i], 1., 0.015);
+    EXPECT_GT(ki_brag[i], 0.);
+    EXPECT_NEAR(ki_multi[i] / ki_brag[i], 1., 0.04);
   }
 }
 

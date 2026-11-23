@@ -298,10 +298,18 @@ This component requires a collision time to be calculated
 The choice of collision frequency used for conduction is set by the
 flag `conduction_collisions_mode`: `multispecies` uses all available
 collision frequencies involving the chosen species, while `braginskii`
-uses only self-collisions .The default is `multispecies` and it is
-recommended for use if solving more than one ion.  If you are solving
-for a single ion and want to recover Braginskii, use the `braginskii`
-mode.
+uses only self-collisions. For electrons, `multispecies` leaves out the
+electron-electron rate: Braginskii's coefficient (3.16 for :math:`Z=1`)
+is defined with the electron-ion collision time and already contains
+the effect of electron-electron collisions, so `multispecies` uses 3.16
+with the sum of all other electron collision frequencies, and
+`braginskii` uses :math:`3.16/\sqrt{2}` with the electron-electron
+rate (Hermes-3's :math:`\nu_{ee}` is :math:`\nu_{ei}/\sqrt{2}` for a
+singly charged ion). For a single, singly charged ion species the two
+modes therefore give the same electron conductivity, up to the
+slightly different Coulomb logarithms of the two rates. The default
+is `multispecies` and it is recommended for use if solving more than
+one ion.
 
 .. math::
     \nabla\cdot\left(\kappa_{||}\mathbf{b}\mathbf{b}\cdot\nabla T\right)

@@ -57,7 +57,7 @@ expected_lines = [
     "he+ conduction collisionality mode: 'multispecies' using he+_d+_coll he+_d_coll he+_e_coll he+_he+_coll he+_he_coll",
     "he neutral collisionality mode: 'multispecies' using he_d+_coll he_d_coll he_e_coll he_he+_coll he_he_coll",
     "d neutral collisionality mode: 'multispecies' using d_d+_coll d_d+_cx d_d_coll d_e_coll d_he+_coll d_he_coll",
-    "e conduction collisionality mode: 'multispecies' using e_d+_coll e_d_coll e_e_coll e_he+_coll e_he_coll",
+    "e conduction collisionality mode: 'multispecies' using e_d+_coll e_d_coll e_he+_coll e_he_coll",
 ]
 
 for line in expected_lines:

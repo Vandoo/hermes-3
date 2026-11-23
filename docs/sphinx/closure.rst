@@ -47,8 +47,10 @@ Collision frequency selection
 
 When configured in ``multispecies``
 mode (default), all collision frequencies for solved collisions of a particular
-species are counted, e.g. electron conduction would include ``ee``, ``ei`` and ``en``
+species are counted, e.g. electron conduction would include ``ei`` and ``en``
 collisions, and ion conduction would include ``ii``, ``ie``, ``in`` and ``CX``.
+Electron conduction leaves out ``ee`` collisions, because the Braginskii electron
+coefficient already includes their effect (see :ref:`sec-braginskii_conduction`).
 In this way, the closure is similar to that used in UEDGE and has
 a way to account for multiple ion species.
 Note that any of the collisions can be disabled (see next section).

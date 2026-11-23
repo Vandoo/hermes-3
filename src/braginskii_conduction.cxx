@@ -53,16 +53,31 @@ BraginskiiConduction::BraginskiiConduction(const std::string& name, Options& all
                              .doc("Save additional output diagnostics")
                              .withDefault<bool>(false);
 
+    all_conduction_collisions_mode[name] =
+        options["conduction_collisions_mode"]
+            .doc("Can be multispecies: all collisions (for electrons all except e-e, "
+                 "which the Braginskii coefficient already includes), or "
+                 "braginskii: self collisions only")
+            .withDefault<std::string>("multispecies");
+
     BoutReal default_kappa; // default conductivity, changes depending on species
     switch (identifySpeciesType(name)) {
     case SpeciesType::ion:
       default_kappa = 3.9;
       break;
     case SpeciesType::electron:
-      // Hermes-3 electron collision time is in Fitzpatrick form (3.187 in
-      // https://farside.ph.utexas.edu/teaching/plasma/Plasma/node41.html) This means that
-      // the Braginskii prefactor of 3.16 needs to be divided by sqrt(2) to be consistent.
-      default_kappa = 3.16 / sqrt(2);
+      if (all_conduction_collisions_mode[name] == "multispecies") {
+        // Braginskii's 3.16 (Z = 1) is defined with the electron-ion collision time
+        // and already contains the effect of e-e collisions, so multispecies mode
+        // uses it with the electron collisions other than e-e (see transform_impl).
+        default_kappa = 3.16;
+      } else {
+        // Hermes-3 electron collision time is in Fitzpatrick form (3.187 in
+        // https://farside.ph.utexas.edu/teaching/plasma/Plasma/node41.html) This means
+        // that the Braginskii prefactor of 3.16 needs to be divided by sqrt(2) to be
+        // consistent when only e-e collisions are used (braginskii mode).
+        default_kappa = 3.16 / sqrt(2);
+      }
       break;
     case SpeciesType::neutral:
       default_kappa = 2.5;
@@ -74,7 +89,8 @@ BraginskiiConduction::BraginskiiConduction(const std::string& name, Options& all
     all_kappa_coefficient[name] =
         options["kappa_coefficient"]
             .doc("Numerical coefficient in parallel heat conduction. Default is "
-                 "3.16/sqrt(2) for electrons, 2.5 for neutrals and 3.9 otherwise")
+                 "3.16 for electrons in multispecies mode, 3.16/sqrt(2) for electrons "
+                 "in braginskii mode, 2.5 for neutrals and 3.9 otherwise")
             .withDefault(default_kappa);
 
     all_kappa_limit_alpha[name] =
@@ -82,11 +98,6 @@ BraginskiiConduction::BraginskiiConduction(const std::string& name, Options& all
             .doc("Flux limiter factor. < 0 means no limit. Typical is 0.2 "
                  "for electrons, 1 for ions.")
             .withDefault(-1.0);
-    all_conduction_collisions_mode[name] =
-        options["conduction_collisions_mode"]
-            .doc("Can be multispecies: all collisions, or "
-                 "braginskii: self collisions and ie")
-            .withDefault<std::string>("multispecies");
   }
 
   std::vector<std::string> coll_types;
@@ -176,11 +187,20 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
           }
         }
 
-        // Multispecies mode: all collisions and CX are included
+        // Multispecies mode: all collisions and CX are included, except e-e for
+        // electrons: Braginskii's electron coefficient already accounts for e-e
+        // collisions, so counting them in the rate as well would lower kappa_e
+        // by the factor 1 + nu_ee/nu_ei (1.7 for a single, singly charged ion)
       } else if (conduction_collisions_mode == "multispecies") {
         for (const auto& collision : species["collision_frequencies"].getChildren()) {
 
           const std::string collision_name = collision.second.name();
+
+          if (species_type == SpeciesType::electron
+              and collisionSpeciesMatch(collision_name, species.name(), "e", "coll",
+                                        "exact")) {
+            continue;
+          }
 
           if ( /// Charge exchange
               (collisionSpeciesMatch(collision_name, species.name(), "", "cx", "partial"))
@@ -218,8 +238,13 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
 
       if (collision_names.empty()) {
         throw BoutException("\tNo collisions found for {:s} in evolve_pressure for "
-                            "selected collisions mode",
-                            species.name());
+                            "selected collisions mode{:s}",
+                            species.name(),
+                            (species_type == SpeciesType::electron
+                             and conduction_collisions_mode == "multispecies")
+                                ? " (multispecies does not use e-e collisions for "
+                                  "electrons; use braginskii mode for e-e only)"
+                                : "");
       }
 
       /// Write chosen collisions to log file
