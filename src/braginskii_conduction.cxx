@@ -1,18 +1,23 @@
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
 #include <bout/bout_types.hxx>
 #include <bout/boutexception.hxx>
 #include <bout/constants.hxx>
+#include <bout/coordinates.hxx>
 #include <bout/difops.hxx>
 #include <bout/field2d.hxx>
 #include <bout/field3d.hxx>
 #include <bout/field_factory.hxx>
 #include <bout/fv_ops.hxx>
 #include <bout/globals.hxx>
+#include <bout/mesh.hxx>
 #include <bout/options.hxx>
 #include <bout/output.hxx>
+#include <bout/region.hxx>
 #include <bout/solver.hxx>
 #include <bout/sys/range.hxx>
 #include <bout/utils.hxx>
@@ -25,6 +30,135 @@
 #include "../include/permissions.hxx"
 
 using bout::globals::mesh;
+
+namespace {
+/// Unlimited conductive flux through the y face between cells a (lower y) and b
+/// (upper y), in field-aligned coordinates. Identical to the face fluxes of
+/// Div_par_K_Grad_par_mod for each conduction_method.
+BoutReal face_flux_unlimited(const Field3D& K, const Field3D& f, const Coordinates* coord,
+                             const Ind3D& a, const Ind3D& b,
+                             bout::ConductionMethod method) {
+  const auto& J = coord->J();
+  const auto& g_22 = coord->g_22();
+  const auto& dy = coord->dy();
+  switch (method) {
+  case bout::ConductionMethod::Original: {
+    const BoutReal c = 0.5 * (K[a] + K[b]);
+    const BoutReal Jf = 0.5 * (J[a] + J[b]);
+    const BoutReal g_22f = 0.5 * (g_22[a] + g_22[b]);
+    return c * Jf * 2. * (f[b] - f[a]) / ((dy[a] + dy[b]) * g_22f);
+  }
+  case bout::ConductionMethod::ProductJK: {
+    const BoutReal cJ = 0.5 * (K[a] * J[a] + K[b] * J[b]);
+    const BoutReal g_22f = 0.5 * (g_22[a] + g_22[b]);
+    return cJ * 2. * (f[b] - f[a]) / ((dy[a] + dy[b]) * g_22f);
+  }
+  case bout::ConductionMethod::Harmonic: {
+    const BoutReal cond_a = K[a] * J[a] / (g_22[a] * dy[a]);
+    const BoutReal cond_b = K[b] * J[b] / (g_22[b] * dy[b]);
+    const BoutReal denom = cond_a + cond_b;
+    const BoutReal C_edge = (std::abs(denom) > std::numeric_limits<BoutReal>::epsilon())
+                                ? 2.0 * cond_a * cond_b / denom
+                                : 0.0;
+    return C_edge * (f[b] - f[a]);
+  }
+  }
+  throw BoutException("Unknown conduction_method");
+}
+
+/// Parallel heat conduction with the free-streaming flux limit applied on each
+/// y face (option kappa_limit_faces), rather than to the cell-centred kappa.
+///
+/// On the face between cells a and b the unlimited flux F is computed with the
+/// same stencil as Div_par_K_Grad_par_mod (selected conduction_method), and
+/// converted to a parallel heat flux density q_SH = F sqrt(g_22) / J (face
+/// averages of J and g_22). The free-streaming flux is taken from the hotter
+/// of the two cells,
+///   q_fl = alpha * P_hot * sqrt(T_hot / AA),
+/// and the face flux is limited as F / (1 + |q_SH| / q_fl), the same harmonic
+/// combination as the cell-centred limiter.
+///
+/// Why: with the cell-centred limiter, a cold cell next to a hot one has a
+/// small q_fl and a large gradient, so it strongly limits its own conductive
+/// heating. The heat crossing a face is carried by particles coming from the
+/// hot side, so q_fl is evaluated there.
+///
+/// Fluxes through target faces are not included (the sheath removes that
+/// heat separately). As alpha -> infinity the result tends to
+/// Div_par_K_Grad_par_mod(K, T, flow_ylow, false, method).
+///
+/// @param kappa_eff  Output: cell-centred K multiplied by the mean of the
+///                   limiting factors 1/(1 + |q_SH|/q_fl) of the cell's faces.
+///                   Used only for kappa_par output (preconditioner,
+///                   magnetic flutter, diagnostics).
+Field3D Div_par_K_Grad_par_facelimited(const Field3D& Kin, const Field3D& Tin,
+                                       const Field3D& Pin, BoutReal AA, BoutReal alpha,
+                                       bout::ConductionMethod method,
+                                       Field3D& flow_ylow, Field3D& kappa_eff) {
+  const Mesh* fmesh = Kin.getMesh();
+  const Coordinates* coord = Tin.getCoordinates();
+
+  const Field3D K = toFieldAligned(Kin, "RGN_NOX");
+  const Field3D T = toFieldAligned(Tin, "RGN_NOX");
+  const Field3D P = toFieldAligned(Pin, "RGN_NOX");
+
+  Field3D result{zeroFrom(T)};
+  Field3D keff = copy(K);
+  flow_ylow = zeroFrom(T);
+
+  // Limited flux through the face between a (lower y) and b (upper y).
+  // factor is set to the limiting factor 1/(1 + |q_SH|/q_fl)
+  auto face_flux = [&](const Ind3D& a, const Ind3D& b, BoutReal& factor) {
+    const BoutReal flux = face_flux_unlimited(K, T, coord, a, b, method);
+    const BoutReal Jf = 0.5 * (coord->J()[a] + coord->J()[b]);
+    const BoutReal g_22f = 0.5 * (coord->g_22()[a] + coord->g_22()[b]);
+    const BoutReal q_SH = flux * sqrt(g_22f) / Jf; // Parallel heat flux density
+
+    const Ind3D hot = (T[b] > T[a]) ? b : a;
+    const BoutReal T_hot = std::max(T[hot], 0.0);
+    const BoutReal q_fl = alpha * std::max(P[hot], 0.0) * sqrt(T_hot / AA);
+
+    factor = 1. / (1. + std::abs(q_SH) / std::max(q_fl, 1e-10));
+    return flux * factor;
+  };
+
+  BOUT_FOR(i, result.getRegion("RGN_NOBNDRY")) {
+    BoutReal factor_sum = 0.0;
+    int nface = 0;
+
+    // Upper face, unless it is a target
+    if (fmesh->periodicY(i.x()) || !fmesh->lastY(i.x()) || (i.y() != fmesh->yend)) {
+      BoutReal factor = 1.0;
+      const BoutReal flux = face_flux(i, i.yp(), factor);
+      result[i] += flux / (coord->dy()[i] * coord->J()[i]);
+      factor_sum += factor;
+      ++nface;
+    }
+    // Lower face, unless it is a target
+    if (fmesh->periodicY(i.x()) || !fmesh->firstY(i.x()) || (i.y() != fmesh->ystart)) {
+      BoutReal factor = 1.0;
+      const BoutReal flux = face_flux(i.ym(), i, factor);
+      result[i] -= flux / (coord->dy()[i] * coord->J()[i]);
+      flow_ylow[i] = -flux * coord->dx()[i] * coord->dz()[i];
+      factor_sum += factor;
+      ++nface;
+    }
+    if (nface > 0) {
+      keff[i] = K[i] * factor_sum / nface;
+    }
+  }
+
+  result = fromFieldAligned(result, "RGN_NOBNDRY");
+  flow_ylow = fromFieldAligned(flow_ylow);
+  kappa_eff = fromFieldAligned(keff);
+
+#if CHECK > 2
+  bout::checkFinite(result);
+#endif
+
+  return result;
+}
+} // namespace
 
 BraginskiiConduction::BraginskiiConduction(const std::string& name, Options& alloptions,
                                            Solver*)
@@ -82,6 +216,13 @@ BraginskiiConduction::BraginskiiConduction(const std::string& name, Options& all
             .doc("Flux limiter factor. < 0 means no limit. Typical is 0.2 "
                  "for electrons, 1 for ions.")
             .withDefault(-1.0);
+    all_kappa_limit_faces[name] =
+        options["kappa_limit_faces"]
+            .doc("Apply the flux limiter to the heat flux on each parallel cell face, "
+                 "with the free-streaming flux of the hotter neighbouring cell, "
+                 "instead of to the cell-centred kappa. Not available for FCI or "
+                 "use_petsc_operator.")
+            .withDefault<bool>(false);
     all_conduction_collisions_mode[name] =
         options["conduction_collisions_mode"]
             .doc("Can be multispecies: all collisions, or "
@@ -239,6 +380,7 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
     Field3D& flow_ylow_conduction = all_flow_ylow_conduction[name];
     const BoutReal kappa_coefficient = all_kappa_coefficient[name];
     const BoutReal kappa_limit_alpha = all_kappa_limit_alpha[name];
+    const bool face_limited = (kappa_limit_alpha > 0.0) and all_kappa_limit_faces[name];
 
     /// Collect the collisionalities based on list of names
     nu = 0;
@@ -272,7 +414,14 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
     // Note: Coefficient is slightly different for electrons (3.16) and ions (3.9)
     kappa_par = kappa_coefficient * Pfloor * tau / AA;
 
-    if (kappa_limit_alpha > 0.0) {
+    if (face_limited) {
+      // Limit is applied on the cell faces below
+      if (P.isFci() or use_petsc_operator) {
+        throw BoutException("{:s}: kappa_limit_faces is not implemented for FCI or "
+                            "use_petsc_operator",
+                            name);
+      }
+    } else if (kappa_limit_alpha > 0.0) {
       /*
        * Flux limiter, as used in SOLPS.
        *
@@ -323,10 +472,37 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
 
     // Note: Flux through boundary turned off, because sheath heat flux
     // is calculated and removed separately
+    if (face_limited) {
+      Field3D kappa_eff;
+      add(species["energy_source"],
+          Div_par_K_Grad_par_facelimited(kappa_par, T, Pfloor, AA, kappa_limit_alpha,
+                                         conduction_method, flow_ylow_conduction,
+                                         kappa_eff));
+      add(species["energy_flow_ylow"], flow_ylow_conduction);
+
+      // Output the face-limited kappa (preconditioner, flutter, diagnostics),
+      // with the same guard cells as the unlimited kappa
+      kappa_par = kappa_eff;
+      mesh->communicate(kappa_par);
+      for (RangeIterator r = mesh->iterateBndryLowerY(); !r.isDone(); r++) {
+        for (int jz = 0; jz < mesh->LocalNz; jz++) {
+          auto i = indexAt(kappa_par, r.ind, mesh->ystart, jz);
+          kappa_par[i.ym()] = kappa_par[i];
+        }
+      }
+      for (RangeIterator r = mesh->iterateBndryUpperY(); !r.isDone(); r++) {
+        for (int jz = 0; jz < mesh->LocalNz; jz++) {
+          auto i = indexAt(kappa_par, r.ind, mesh->yend, jz);
+          kappa_par[i.yp()] = kappa_par[i];
+        }
+      }
+    }
     set(species["kappa_par"], kappa_par);
 
-    // Petsc can be used to calculate the divergence of the heat flux
-    if (use_petsc_operator) {
+    if (face_limited) {
+      // Conduction already added above
+    } else if (use_petsc_operator) {
+      // Petsc can be used to calculate the divergence of the heat flux
 #if BOUT_HAS_PETSC
       add(species["energy_source"], petsc_parallel.Div_par_K_Grad_par(kappa_par, T));
 #endif

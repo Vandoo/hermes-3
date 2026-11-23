@@ -306,6 +306,42 @@ mode.
 .. math::
     \nabla\cdot\left(\kappa_{||}\mathbf{b}\mathbf{b}\cdot\nabla T\right)
 
+The conductive heat flux can be limited to a fraction
+:math:`\alpha` = `kappa_limit_alpha` of the free-streaming flux (off by
+default; typical values are 0.2 for electrons and 1 for ions, see
+R. Schneider et al., Contrib. Plasma Phys. 46, 3 (2006)):
+
+.. math::
+
+   q_{fl} = \alpha\, n T \sqrt{T / m}, \qquad
+   \kappa_{||} \rightarrow \frac{\kappa_{||}}{1 + \left|q_{SH} / q_{fl}\right|}
+
+where :math:`q_{SH} = \kappa_{||}\nabla_{||}T` is the unlimited heat
+flux. By default this is applied to the cell-centred
+:math:`\kappa_{||}`, using the temperature and gradient of each cell.
+
+With `kappa_limit_faces = true` the same harmonic combination is instead
+applied to the heat flux through each parallel cell face. :math:`q_{SH}`
+is the unlimited face flux of the selected `conduction_method`, and
+:math:`q_{fl}` is evaluated with the pressure and temperature of the
+hotter of the two cells, since the heat crossing the face is carried by
+particles coming from the hot side. With the cell-centred form, a cold
+cell next to hot ones has a free-streaming flux that is orders of
+magnitude smaller than its neighbours', so it strongly limits its own
+conductive heating. The face form avoids this. For large
+:math:`\alpha` both forms tend to the unlimited operator. The face form
+is not implemented for FCI or `use_petsc_operator`. The output
+`kappa_par` is then the cell-centred :math:`\kappa_{||}` multiplied by
+the mean limiting factor of the cell's two faces; it is used by the
+preconditioner, the magnetic flutter terms and diagnostics, but not for
+the conductive flux itself.
+
+.. code-block:: ini
+
+   [e]
+   kappa_limit_alpha = 0.2
+   kappa_limit_faces = true
+
 .. doxygenstruct:: BraginskiiConduction
    :members:
 

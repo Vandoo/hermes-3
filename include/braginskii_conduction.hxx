@@ -32,6 +32,9 @@ struct BraginskiiConduction : public NamedComponent<BraginskiiConduction> {
   ///   - kappa_coefficient            Heat conduction constant. Default is 3.16 for
   ///                                  electrons, 3.9 otherwise
   ///   - kappa_limit_alpha            Flux limiter, off by default.
+  ///   - kappa_limit_faces            Apply the flux limiter on each parallel cell
+  ///                                  face, with the free-streaming flux of the
+  ///                                  hotter cell. Default false (cell-centred).
   ///   - conduction_collisions_mode   Can be multispecies: all collisions, or braginskii:
   ///                                  self collisions and ie
   ///
@@ -58,6 +61,8 @@ private:
       all_kappa_coefficient; ///< Leading numerical coefficient in parallel heat flux
                              ///< calculation
   std::map<std::string, BoutReal> all_kappa_limit_alpha; ///< Flux limit if >0
+  std::map<std::string, bool>
+      all_kappa_limit_faces; ///< Apply the flux limit on cell faces?
   std::map<std::string, Field3D>
       all_flow_ylow_conduction; ///< Conduction energy flow diagnostics
   /// Save more diagnostics?
