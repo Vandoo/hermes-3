@@ -1,8 +1,13 @@
 #include <cmath>
+#include <memory>
 #include <string>
 #include <utility>
 
 #include <bout/bout_types.hxx>
+#include <bout/constants.hxx>
+#include <bout/coordinates.hxx>
+#include <bout/fieldgroup.hxx>
+#include <bout/paralleltransform.hxx>
 #include <bout/region.hxx>
 #include <bout/solver.hxx>
 #include <bout/utils.hxx>
@@ -237,6 +242,44 @@ TEST_F(BraginskiiConductionTest, FaceLimiterLargeAlphaMatchesUnlimited) {
 }
 
 TEST_F(BraginskiiConductionTest, FaceLimiterReducesConduction) {
+  // Check the flux through each face directly: it must equal the unlimited
+  // face flux F times 1 / (1 + |F| / q_fl), with q_fl from the hotter cell
+  // (unit metrics, so F is also the heat flux density), and so keep its sign
+  // and be smaller in magnitude
+  const BoutReal alpha = 0.2, AA = 2.0;
+  BraginskiiConduction unlimited = this->makeComponent(1.);
+  BraginskiiConduction face = this->makeLimitedComponent(alpha, true);
+  Options state_unlimited = this->makeState(this->temp2);
+  Options state_face = this->makeState(this->temp2);
+
+  unlimited.declareAllSpecies({"test+"});
+  unlimited.transform(state_unlimited);
+  face.declareAllSpecies({"test+"});
+  face.transform(state_face);
+
+  const Field3D K = state_unlimited["species"]["test+"]["kappa_par"];
+  const Field3D flow_unlimited = state_unlimited["species"]["test+"]["energy_flow_ylow"];
+  const Field3D flow_face = state_face["species"]["test+"]["energy_flow_ylow"];
+  const Field3D& T = this->temp2;
+  BOUT_FOR_SERIAL(i, flow_face.getRegion("RGN_NOBNDRY")) {
+    const auto im = i.ym();
+    const BoutReal F = 0.5 * (K[im] + K[i]) * (T[i] - T[im]);
+    const auto hot = (T[i] > T[im]) ? i : im;
+    const BoutReal q_fl = alpha * T[hot] * std::sqrt(T[hot] / AA); // P = T
+    const BoutReal expected = -F / (1. + std::abs(F) / q_fl);      // flow = -flux
+
+    ASSERT_NE(flow_unlimited[i], 0.);
+    EXPECT_NEAR(flow_unlimited[i], -F, 1e-12 * std::abs(F));
+    EXPECT_NEAR(flow_face[i], expected, 1e-12 * std::abs(expected));
+    EXPECT_GT(flow_face[i] * flow_unlimited[i], 0.);
+    EXPECT_LT(std::abs(flow_face[i]), std::abs(flow_unlimited[i]));
+  }
+}
+
+TEST_F(BraginskiiConductionTest, FaceLimiterKappaParBounded) {
+  // The published kappa_par (preconditioner, flutter, diagnostics) must be
+  // finite everywhere, including guard cells, lie between 0 and the
+  // unlimited kappa, and copy the physical x guards from the domain
   BraginskiiConduction unlimited = this->makeComponent(1.);
   BraginskiiConduction face = this->makeLimitedComponent(0.2, true);
   Options state_unlimited = this->makeState(this->temp2);
@@ -247,11 +290,24 @@ TEST_F(BraginskiiConductionTest, FaceLimiterReducesConduction) {
   face.declareAllSpecies({"test+"});
   face.transform(state_face);
 
-  Field3D conduction_unlimited = this->getDeriv(state_unlimited);
-  Field3D conduction_face = this->getDeriv(state_face);
-  BOUT_FOR_SERIAL(i, conduction_face.getRegion("RGN_NOBNDRY")) {
-    // Each face flux is reduced but keeps its sign
-    EXPECT_LT(std::abs(conduction_face[i]), std::abs(conduction_unlimited[i]));
+  const Field3D kappa_unlimited = state_unlimited["species"]["test+"]["kappa_par"];
+  const Field3D kappa_face = state_face["species"]["test+"]["kappa_par"];
+  BOUT_FOR_SERIAL(i, kappa_face.getRegion("RGN_ALL")) {
+    EXPECT_TRUE(std::isfinite(kappa_face[i]));
+    EXPECT_GE(kappa_face[i], 0.);
+  }
+  BOUT_FOR_SERIAL(i, kappa_face.getRegion("RGN_NOBNDRY")) {
+    EXPECT_LE(kappa_face[i], kappa_unlimited[i]);
+  }
+  for (int y = 0; y < mesh->LocalNy; y++) {
+    for (int z = 0; z < mesh->LocalNz; z++) {
+      for (int x = 0; x < mesh->xstart; x++) {
+        EXPECT_EQ(kappa_face(x, y, z), kappa_face(mesh->xstart, y, z));
+      }
+      for (int x = mesh->xend + 1; x < mesh->LocalNx; x++) {
+        EXPECT_EQ(kappa_face(x, y, z), kappa_face(mesh->xend, y, z));
+      }
+    }
   }
 }
 
@@ -314,6 +370,105 @@ TEST_F(BraginskiiConductionTest, FaceLimiterUsesHotSideFreeStreaming) {
       EXPECT_DOUBLE_EQ(conduction(x, y_cold + 1, z), 0.0);
     }
   }
+}
+
+/// FakeMesh with closed field lines on one processor and a poloidal branch
+/// cut between yend and ystart (one y guard cell): y communication copies the
+/// guard cells periodically, as BoutMesh does across the cut with a shifted
+/// metric (no twist-shift in the communication itself).
+class BranchCutMesh : public FakeMesh {
+public:
+  BranchCutMesh(int nx, int ny, int nz, BoutReal shift_angle)
+      : FakeMesh(nx, ny, nz), shift_angle(shift_angle) {}
+  BoutReal shift_angle;
+
+  std::pair<bool, BoutReal> hasBranchCutLower(int jx) const override {
+    return std::make_pair(periodicY(jx), shift_angle);
+  }
+  std::pair<bool, BoutReal> hasBranchCutUpper(int jx) const override {
+    return std::make_pair(periodicY(jx), shift_angle);
+  }
+  RangeIterator iterateBndryLowerY() const override { return RangeIterator(); }
+  RangeIterator iterateBndryUpperY() const override { return RangeIterator(); }
+
+  comm_handle send(FieldGroup& g) override { return sendY(g); }
+  comm_handle sendY(FieldGroup& g, comm_handle UNUSED(handle) = nullptr) override {
+    for (Field3D* f : g.field3d()) {
+      for (int x = 0; x < LocalNx; x++) {
+        for (int z = 0; z < LocalNz; z++) {
+          (*f)(x, ystart - 1, z) = (*f)(x, yend, z);
+          (*f)(x, yend + 1, z) = (*f)(x, ystart, z);
+        }
+      }
+    }
+    return nullptr;
+  }
+};
+
+TEST_F(BraginskiiConductionTest, FaceLimiterConservesEnergyAcrossBranchCut) {
+  // Closed field lines with a shifted metric and a branch cut whose
+  // ShiftAngle is not a whole number of z cells. The guard cells at the cut
+  // are then shifted by a fractional offset, so the two cells next to the cut
+  // see the face at different toroidal positions; the limited face flux must
+  // still be counted once, so that the energy source sums to zero over the
+  // closed field lines.
+  constexpr int nx = 3, ny = 7, nz = 7;
+  const BoutReal shift_angle = 1.11; // In units of z cells (dz = 1)
+  Mesh* const fixture_mesh = bout::globals::mesh;
+  BranchCutMesh bc_mesh(nx, ny, nz, shift_angle);
+  bout::globals::mesh = &bc_mesh;
+  bc_mesh.createDefaultRegions();
+  bc_mesh.setCoordinates(nullptr);
+  auto coords = std::make_shared<Coordinates>(
+      &bc_mesh, Field2D{1.0}, Field2D{1.0}, Field2D{1.0}, Field2D{1.0}, Field2D{1.0},
+      Field2D{1.0}, Field2D{1.0}, Field2D{1.0}, Field2D{0.0}, Field2D{0.0},
+      Field2D{0.0}, Field2D{1.0}, Field2D{1.0}, Field2D{1.0}, Field2D{0.0},
+      Field2D{0.0}, Field2D{0.0}, Field2D{0.0}, Field2D{0.0});
+  bc_mesh.setCoordinates(coords);
+  bc_mesh.setGridDataSource(new FakeGridDataSource());
+
+  // zShift grows along y; the guard cells at the cut are offset by
+  // ShiftAngle, as Coordinates does for a grid file
+  Field2D zShift{0.0};
+  for (int x = 0; x < nx; x++) {
+    for (int y = bc_mesh.ystart; y <= bc_mesh.yend; y++) {
+      zShift(x, y) = 0.37 * y;
+    }
+    zShift(x, bc_mesh.ystart - 1) = zShift(x, bc_mesh.yend) - shift_angle;
+    zShift(x, bc_mesh.yend + 1) = zShift(x, bc_mesh.ystart) + shift_angle;
+  }
+  coords->setParallelTransform(
+      std::make_unique<ShiftedMetric>(bc_mesh, CELL_CENTRE, zShift, nz * 1.0));
+
+  // Positive temperature varying in y and z, periodic across the cut
+  Field3D temperature{1.0};
+  const int ny_domain = bc_mesh.yend - bc_mesh.ystart + 1;
+  BOUT_FOR_SERIAL(i, temperature.getRegion("RGN_ALL")) {
+    temperature[i] = 1. + 0.5 * std::sin(2. * PI * (i.y() - bc_mesh.ystart) / ny_domain)
+                     + 0.3 * std::cos(2. * PI * i.z() / nz + i.y());
+  }
+  bc_mesh.communicate(temperature);
+
+  {
+    BraginskiiConduction face = this->makeLimitedComponent(0.2, true);
+    Options state = this->makeState(temperature);
+    face.declareAllSpecies({"test+"});
+    face.transform(state);
+
+    const Field3D conduction = this->getDeriv(state);
+    for (int x = bc_mesh.xstart; x <= bc_mesh.xend; x++) {
+      BoutReal total = 0.0, scale = 0.0; // Unit metrics: cell volume 1
+      for (int y = bc_mesh.ystart; y <= bc_mesh.yend; y++) {
+        for (int z = 0; z < nz; z++) {
+          total += conduction(x, y, z);
+          scale += std::abs(conduction(x, y, z));
+        }
+      }
+      EXPECT_GT(scale, 0.);
+      EXPECT_NEAR(total, 0.0, 1e-12 * scale);
+    }
+  }
+  bout::globals::mesh = fixture_mesh;
 }
 
 // TODO: Add tests for more types of collisions (e.g., electron-ion, charge-exchante, ion

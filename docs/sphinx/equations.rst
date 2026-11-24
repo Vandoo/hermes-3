@@ -333,13 +333,18 @@ z) before the face fluxes are formed, and can then become negative on
 some faces, which drives heat from the colder cell into the hotter one.
 The face form shifts only the unlimited :math:`\kappa_{||}`, :math:`T`
 and :math:`P`, and its limiting factor lies between 0 and 1, so each
-face flux keeps the sign of the unlimited one. For large
-:math:`\alpha` both forms tend to the unlimited operator. The face form
-is not implemented for FCI or `use_petsc_operator`. The output
-`kappa_par` is then the cell-centred :math:`\kappa_{||}` multiplied by
-the mean limiting factor of the cell's two faces; it is used by the
-preconditioner, the magnetic flutter terms and diagnostics, but not for
-the conductive flux itself.
+face flux keeps the sign of the unlimited face flux. This removes the
+negative face conductivities caused by shifting an already limited
+:math:`\kappa_{||}`; the shift of the unlimited :math:`\kappa_{||}` is
+the same as without a limiter. Each face flux is applied to both
+neighbouring cells with the same value, including at a poloidal branch
+cut, so the face form conserves energy. For large :math:`\alpha` both
+forms tend to the unlimited operator. The face form is not implemented
+for FCI or `use_petsc_operator`. The output `kappa_par` is then the
+unlimited :math:`\kappa_{||}` multiplied by the mean limiting factor of
+the cell's faces, clipped to [0, 1]; it is used by the preconditioner,
+the magnetic flutter terms and diagnostics, but not for the conductive
+flux itself.
 
 .. code-block:: ini
 

@@ -17,6 +17,7 @@
 #include <bout/mesh.hxx>
 #include <bout/options.hxx>
 #include <bout/output.hxx>
+#include <bout/paralleltransform.hxx>
 #include <bout/region.hxx>
 #include <bout/solver.hxx>
 #include <bout/sys/range.hxx>
@@ -85,24 +86,39 @@ BoutReal face_flux_unlimited(const Field3D& K, const Field3D& f, const Coordinat
 /// kappa can ring to negative values on some faces; a negative face
 /// conductivity drives heat from the colder cell into the hotter one. Here
 /// only the unlimited K, T and P are shifted, and the limiting factor lies in
-/// (0, 1], so each face flux keeps the sign of the unlimited one. The cap
+/// (0, 1], so each face flux keeps the sign of the unlimited face flux. This
+/// removes the ringing caused by shifting an already limited kappa; the shift
+/// of the unlimited kappa is the same as without a limiter. The cap
 /// uses the face's own gradient, and q_fl is that of the side the heat comes
 /// from (cf. the upwind saturated flux of Mignone et al. 2012, ApJS 198, 7,
 /// Appendix A).
 ///
 /// Fluxes through target faces are not included (the sheath removes that
-/// heat separately). As alpha -> infinity the result tends to
+/// heat separately). As alpha -> infinity, for positive hot-side pressure and
+/// temperature, the face fluxes tend to those of
 /// Div_par_K_Grad_par_mod(K, T, flow_ylow, false, method).
 ///
-/// @param kappa_eff  Output: cell-centred K multiplied by the mean of the
-///                   limiting factors 1/(1 + |q_SH|/q_fl) of the cell's faces.
-///                   Used only for kappa_par output (preconditioner,
-///                   magnetic flutter, diagnostics).
+/// Each face flux is applied to both cells with the same value. Interior
+/// faces are evaluated by both cells from identical field-aligned samples.
+/// At a poloidal branch cut the guard cells are shifted with a zShift offset
+/// by ShiftAngle, so the two cells see the same rows at different toroidal
+/// positions; with a fractional offset the FFT interpolates, and because the
+/// limiter is nonlinear the two evaluations would not have the same sum over
+/// z. There the cell below the cut takes the flux computed by the cell above
+/// it (its lower face), shifted back to standard coordinates, communicated
+/// and shifted into its own frame. Shifts preserve the sum over z, so energy
+/// is conserved.
+///
+/// @param face_factor  Output: mean of the limiting factors 1/(1 + |q_SH|/q_fl)
+///                     of each cell's faces, in standard (not field-aligned)
+///                     coordinates, clipped to [0, 1] (the inverse shift of a
+///                     cell-to-cell varying factor can ring outside it). Valid
+///                     in RGN_NOBNDRY. Used only for the kappa_par output.
 Field3D Div_par_K_Grad_par_facelimited(const Field3D& Kin, const Field3D& Tin,
                                        const Field3D& Pin, BoutReal AA, BoutReal alpha,
                                        bout::ConductionMethod method,
-                                       Field3D& flow_ylow, Field3D& kappa_eff) {
-  const Mesh* fmesh = Kin.getMesh();
+                                       Field3D& flow_ylow, Field3D& face_factor) {
+  Mesh* fmesh = Kin.getMesh();
   const Coordinates* coord = Tin.getCoordinates();
 
   const Field3D K = toFieldAligned(Kin, "RGN_NOX");
@@ -110,12 +126,15 @@ Field3D Div_par_K_Grad_par_facelimited(const Field3D& Kin, const Field3D& Tin,
   const Field3D P = toFieldAligned(Pin, "RGN_NOX");
 
   Field3D result{zeroFrom(T)};
-  Field3D keff = copy(K);
   flow_ylow = zeroFrom(T);
+  Field3D flux_lower{zeroFrom(T)}; // Limited flux through each cell's lower face
+  Field3D flux_upper{zeroFrom(T)}; // Limited flux through each cell's upper face
+  Field3D factor{zeroFrom(T)};     // Mean limiting factor of each cell's faces
+  BOUT_FOR(i, factor.getRegion("RGN_ALL")) { factor[i] = 1.0; }
 
   // Limited flux through the face between a (lower y) and b (upper y).
-  // factor is set to the limiting factor 1/(1 + |q_SH|/q_fl)
-  auto face_flux = [&](const Ind3D& a, const Ind3D& b, BoutReal& factor) {
+  // limit is set to the limiting factor 1/(1 + |q_SH|/q_fl)
+  auto face_flux = [&](const Ind3D& a, const Ind3D& b, BoutReal& limit) {
     const BoutReal flux = face_flux_unlimited(K, T, coord, a, b, method);
     const BoutReal Jf = 0.5 * (coord->J()[a] + coord->J()[b]);
     const BoutReal g_22f = 0.5 * (coord->g_22()[a] + coord->g_22()[b]);
@@ -125,8 +144,8 @@ Field3D Div_par_K_Grad_par_facelimited(const Field3D& Kin, const Field3D& Tin,
     const BoutReal T_hot = std::max(T[hot], 0.0);
     const BoutReal q_fl = alpha * std::max(P[hot], 0.0) * sqrt(T_hot / AA);
 
-    factor = 1. / (1. + std::abs(q_SH) / std::max(q_fl, 1e-10));
-    return flux * factor;
+    limit = 1. / (1. + std::abs(q_SH) / std::max(q_fl, 1e-10));
+    return flux * limit;
   };
 
   BOUT_FOR(i, result.getRegion("RGN_NOBNDRY")) {
@@ -135,29 +154,51 @@ Field3D Div_par_K_Grad_par_facelimited(const Field3D& Kin, const Field3D& Tin,
 
     // Upper face, unless it is a target
     if (fmesh->periodicY(i.x()) || !fmesh->lastY(i.x()) || (i.y() != fmesh->yend)) {
-      BoutReal factor = 1.0;
-      const BoutReal flux = face_flux(i, i.yp(), factor);
-      result[i] += flux / (coord->dy()[i] * coord->J()[i]);
-      factor_sum += factor;
+      BoutReal f = 1.0;
+      flux_upper[i] = face_flux(i, i.yp(), f);
+      result[i] += flux_upper[i] / (coord->dy()[i] * coord->J()[i]);
+      factor_sum += f;
       ++nface;
     }
     // Lower face, unless it is a target
     if (fmesh->periodicY(i.x()) || !fmesh->firstY(i.x()) || (i.y() != fmesh->ystart)) {
-      BoutReal factor = 1.0;
-      const BoutReal flux = face_flux(i.ym(), i, factor);
-      result[i] -= flux / (coord->dy()[i] * coord->J()[i]);
-      flow_ylow[i] = -flux * coord->dx()[i] * coord->dz()[i];
-      factor_sum += factor;
+      BoutReal f = 1.0;
+      flux_lower[i] = face_flux(i.ym(), i, f);
+      result[i] -= flux_lower[i] / (coord->dy()[i] * coord->J()[i]);
+      flow_ylow[i] = -flux_lower[i] * coord->dx()[i] * coord->dz()[i];
+      factor_sum += f;
       ++nface;
     }
     if (nface > 0) {
-      keff[i] = K[i] * factor_sum / nface;
+      factor[i] = factor_sum / nface;
+    }
+  }
+
+  // Branch cuts: replace the upper-face flux of the last cell before the cut
+  // by the lower-face flux of the first cell after it. All processors take
+  // part in the communication; only cells with a branch cut use the result.
+  if (dynamic_cast<const ShiftedMetric*>(&coord->getParallelTransform()) != nullptr) {
+    Field3D flux_lower_std = fromFieldAligned(flux_lower);
+    fmesh->communicate(flux_lower_std);
+    const Field3D flux_from_above = toFieldAligned(flux_lower_std, "RGN_NOX");
+    for (int x = fmesh->xstart; x <= fmesh->xend; x++) {
+      if (!fmesh->hasBranchCutUpper(x).first) {
+        continue;
+      }
+      for (int z = 0; z < fmesh->LocalNz; z++) {
+        const auto i = indexAt(result, x, fmesh->yend, z);
+        result[i] += (flux_from_above[i.yp()] - flux_upper[i])
+                     / (coord->dy()[i] * coord->J()[i]);
+      }
     }
   }
 
   result = fromFieldAligned(result, "RGN_NOBNDRY");
   flow_ylow = fromFieldAligned(flow_ylow);
-  kappa_eff = fromFieldAligned(keff);
+  face_factor = fromFieldAligned(factor);
+  BOUT_FOR(i, face_factor.getRegion("RGN_NOBNDRY")) {
+    face_factor[i] = std::clamp(face_factor[i], 0.0, 1.0);
+  }
 
 #if CHECK > 2
   bout::checkFinite(result);
@@ -480,16 +521,19 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
     // Note: Flux through boundary turned off, because sheath heat flux
     // is calculated and removed separately
     if (face_limited) {
-      Field3D kappa_eff;
+      Field3D face_factor;
       add(species["energy_source"],
           Div_par_K_Grad_par_facelimited(kappa_par, T, Pfloor, AA, kappa_limit_alpha,
                                          conduction_method, flow_ylow_conduction,
-                                         kappa_eff));
+                                         face_factor));
       add(species["energy_flow_ylow"], flow_ylow_conduction);
 
-      // Output the face-limited kappa (preconditioner, flutter, diagnostics),
-      // with the same guard cells as the unlimited kappa
-      kappa_par = kappa_eff;
+      // Output kappa (preconditioner, flutter, diagnostics): the unlimited
+      // kappa times the mean limiting factor of the cell's faces, so
+      // 0 <= kappa_par <= unlimited kappa. Only the domain cells are changed;
+      // guard cells are then set as for the unlimited kappa, and the physical
+      // x guards are copied from the neighbouring domain cell.
+      BOUT_FOR(i, kappa_par.getRegion("RGN_NOBNDRY")) { kappa_par[i] *= face_factor[i]; }
       mesh->communicate(kappa_par);
       for (RangeIterator r = mesh->iterateBndryLowerY(); !r.isDone(); r++) {
         for (int jz = 0; jz < mesh->LocalNz; jz++) {
@@ -501,6 +545,20 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
         for (int jz = 0; jz < mesh->LocalNz; jz++) {
           auto i = indexAt(kappa_par, r.ind, mesh->yend, jz);
           kappa_par[i.yp()] = kappa_par[i];
+        }
+      }
+      for (int y = 0; y < mesh->LocalNy; y++) {
+        for (int z = 0; z < mesh->LocalNz; z++) {
+          if (mesh->firstX()) {
+            for (int x = 0; x < mesh->xstart; x++) {
+              kappa_par(x, y, z) = kappa_par(mesh->xstart, y, z);
+            }
+          }
+          if (mesh->lastX()) {
+            for (int x = mesh->xend + 1; x < mesh->LocalNx; x++) {
+              kappa_par(x, y, z) = kappa_par(mesh->xend, y, z);
+            }
+          }
         }
       }
     }
