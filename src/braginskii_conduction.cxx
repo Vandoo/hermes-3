@@ -113,7 +113,9 @@ BoutReal face_flux_unlimited(const Field3D& K, const Field3D& f, const Coordinat
 /// z. There the cell below the cut takes the flux computed by the cell above
 /// it (its lower face), shifted back to standard coordinates, communicated
 /// and shifted into its own frame. Shifts preserve the sum over z, so energy
-/// is conserved.
+/// is conserved when J does not vary in z (2-D metrics). With 3-D metrics the
+/// source is divided by J before the inverse shift, which does not commute
+/// with it, as in Div_par_K_Grad_par_mod.
 ///
 /// @param face_factor  Output: mean of the limiting factors 1/(1 + |q_SH|/q_fl)
 ///                     of each cell's faces, in standard (not field-aligned)

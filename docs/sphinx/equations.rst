@@ -338,7 +338,8 @@ negative face conductivities caused by shifting an already limited
 :math:`\kappa_{||}`; the shift of the unlimited :math:`\kappa_{||}` is
 the same as without a limiter. Each face flux is applied to both
 neighbouring cells with the same value, including at a poloidal branch
-cut, so the face form conserves energy. For large :math:`\alpha` both
+cut, so the face form conserves energy (exactly with 2-D metrics, where
+:math:`J` does not vary in z). For large :math:`\alpha` both
 forms tend to the unlimited operator, except that the face form keeps
 this shared flux on the face at a branch cut with a shifted metric, where
 the unlimited operator evaluates the face in each cell's frame. The face
