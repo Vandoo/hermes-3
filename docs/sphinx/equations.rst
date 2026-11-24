@@ -339,8 +339,12 @@ negative face conductivities caused by shifting an already limited
 the same as without a limiter. Each face flux is applied to both
 neighbouring cells with the same value, including at a poloidal branch
 cut, so the face form conserves energy. For large :math:`\alpha` both
-forms tend to the unlimited operator. The face form is not implemented
-for FCI or `use_petsc_operator`. The output `kappa_par` is then the
+forms tend to the unlimited operator, except that the face form keeps
+this shared flux on the face at a branch cut with a shifted metric, where
+the unlimited operator evaluates the face in each cell's frame. The face
+form requires `paralleltransform` type `identity` or `shifted` (not
+`shiftedinterp` or FCI) and is not implemented for `use_petsc_operator`.
+The output `kappa_par` is then the
 unlimited :math:`\kappa_{||}` multiplied by the mean limiting factor of
 the cell's faces, clipped to [0, 1]; it is used by the preconditioner,
 the magnetic flutter terms and diagnostics, but not for the conductive

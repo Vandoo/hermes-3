@@ -96,7 +96,13 @@ BoutReal face_flux_unlimited(const Field3D& K, const Field3D& f, const Coordinat
 /// Fluxes through target faces are not included (the sheath removes that
 /// heat separately). As alpha -> infinity, for positive hot-side pressure and
 /// temperature, the face fluxes tend to those of
-/// Div_par_K_Grad_par_mod(K, T, flow_ylow, false, method).
+/// Div_par_K_Grad_par_mod(K, T, flow_ylow, false, method), except on the face
+/// at a poloidal branch cut with a shifted metric, where the shared flux
+/// described below is still used (Div_par_K_Grad_par_mod evaluates that face
+/// in each cell's frame).
+///
+/// Only the identity and FFT shifted-metric transforms are supported (checked
+/// by the caller).
 ///
 /// Each face flux is applied to both cells with the same value. Interior
 /// faces are evaluated by both cells from identical field-aligned samples.
@@ -268,8 +274,8 @@ BraginskiiConduction::BraginskiiConduction(const std::string& name, Options& all
         options["kappa_limit_faces"]
             .doc("Apply the flux limiter to the heat flux on each parallel cell face, "
                  "with the free-streaming flux of the hotter neighbouring cell, "
-                 "instead of to the cell-centred kappa. Not available for FCI or "
-                 "use_petsc_operator.")
+                 "instead of to the cell-centred kappa. Requires paralleltransform "
+                 "type identity or shifted; not available for use_petsc_operator.")
             .withDefault<bool>(false);
     all_conduction_collisions_mode[name] =
         options["conduction_collisions_mode"]
@@ -469,6 +475,15 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
                             "use_petsc_operator",
                             name);
       }
+      // The branch-cut treatment below relies on a shift that keeps the sum
+      // over z (FFT); other transforms (e.g. shiftedinterp) are not supported
+      const auto& transform = P.getCoordinates()->getParallelTransform();
+      if (dynamic_cast<const ShiftedMetric*>(&transform) == nullptr
+          and dynamic_cast<const ParallelTransformIdentity*>(&transform) == nullptr) {
+        throw BoutException("{:s}: kappa_limit_faces requires paralleltransform type "
+                            "'identity' or 'shifted'",
+                            name);
+      }
     } else if (kappa_limit_alpha > 0.0) {
       /*
        * Flux limiter, as used in SOLPS.
@@ -531,8 +546,9 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
       // Output kappa (preconditioner, flutter, diagnostics): the unlimited
       // kappa times the mean limiting factor of the cell's faces, so
       // 0 <= kappa_par <= unlimited kappa. Only the domain cells are changed;
-      // guard cells are then set as for the unlimited kappa, and the physical
-      // x guards are copied from the neighbouring domain cell.
+      // guard cells are then communicated, the target y guards copied from
+      // the domain, and the physical (non-periodic) x guards copied from the
+      // neighbouring domain cell.
       BOUT_FOR(i, kappa_par.getRegion("RGN_NOBNDRY")) { kappa_par[i] *= face_factor[i]; }
       mesh->communicate(kappa_par);
       for (RangeIterator r = mesh->iterateBndryLowerY(); !r.isDone(); r++) {
@@ -549,12 +565,14 @@ void BraginskiiConduction::transform_impl(GuardedOptions& state) {
       }
       for (int y = 0; y < mesh->LocalNy; y++) {
         for (int z = 0; z < mesh->LocalNz; z++) {
-          if (mesh->firstX()) {
+          // firstX()/lastX() are also true with periodicX, where the x guards
+          // were set by the communication
+          if (mesh->firstX() and not mesh->periodicX) {
             for (int x = 0; x < mesh->xstart; x++) {
               kappa_par(x, y, z) = kappa_par(mesh->xstart, y, z);
             }
           }
-          if (mesh->lastX()) {
+          if (mesh->lastX() and not mesh->periodicX) {
             for (int x = mesh->xend + 1; x < mesh->LocalNx; x++) {
               kappa_par(x, y, z) = kappa_par(mesh->xend, y, z);
             }

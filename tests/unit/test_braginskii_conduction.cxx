@@ -471,5 +471,97 @@ TEST_F(BraginskiiConductionTest, FaceLimiterConservesEnergyAcrossBranchCut) {
   bout::globals::mesh = fixture_mesh;
 }
 
+TEST_F(BraginskiiConductionTest, FaceLimiterRejectsOtherTransforms) {
+  // The branch-cut treatment relies on a shift that keeps the sum over z, so
+  // the face form accepts only the identity and FFT shifted-metric
+  // transforms. MockParallelTransform (not FCI) stands for e.g. shiftedinterp.
+  mesh->getCoordinates()->setParallelTransform(
+      std::make_unique<MockParallelTransform>(*mesh, true));
+  BraginskiiConduction face = this->makeLimitedComponent(0.2, true);
+  Options state = this->makeState(this->temp2);
+  face.declareAllSpecies({"test+"});
+  bool thrown = false;
+  try {
+    face.transform(state);
+  } catch (const BoutException& e) {
+    thrown = true;
+    EXPECT_NE(std::string(e.what()).find("paralleltransform"), std::string::npos)
+        << e.what();
+  }
+  EXPECT_TRUE(thrown);
+  mesh->getCoordinates()->setParallelTransform(
+      std::make_unique<ParallelTransformIdentity>(*mesh));
+}
+
+/// FakeMesh that is periodic in x on one processor: x communication copies
+/// the guard cells from the opposite edge of the domain
+class PeriodicXMesh : public FakeMesh {
+public:
+  PeriodicXMesh(int nx, int ny, int nz) : FakeMesh(nx, ny, nz) { periodicX = true; }
+
+  comm_handle send(FieldGroup& g) override { return sendX(g); }
+  comm_handle sendX(FieldGroup& g, comm_handle UNUSED(handle) = nullptr,
+                    bool UNUSED(disable_corners) = false) override {
+    const int nx_domain = xend - xstart + 1;
+    for (Field3D* f : g.field3d()) {
+      for (int y = 0; y < LocalNy; y++) {
+        for (int z = 0; z < LocalNz; z++) {
+          for (int x = 0; x < xstart; x++) {
+            (*f)(x, y, z) = (*f)(x + nx_domain, y, z);
+          }
+          for (int x = xend + 1; x < LocalNx; x++) {
+            (*f)(x, y, z) = (*f)(x - nx_domain, y, z);
+          }
+        }
+      }
+    }
+    return nullptr;
+  }
+};
+
+TEST_F(BraginskiiConductionTest, FaceLimiterKappaParPeriodicX) {
+  // With periodicX, firstX() and lastX() are still true on the edge
+  // processors, but the x guards of kappa_par come from the communication
+  // (the opposite edge), and must not be overwritten by the local edge
+  constexpr int nx = 5, ny = 5, nz = 3;
+  Mesh* const fixture_mesh = bout::globals::mesh;
+  PeriodicXMesh px_mesh(nx, ny, nz);
+  bout::globals::mesh = &px_mesh;
+  px_mesh.createDefaultRegions();
+  px_mesh.setCoordinates(nullptr);
+  px_mesh.setGridDataSource(new FakeGridDataSource());
+  auto coords = std::make_shared<Coordinates>(
+      &px_mesh, Field2D{1.0}, Field2D{1.0}, Field2D{1.0}, Field2D{1.0}, Field2D{1.0},
+      Field2D{1.0}, Field2D{1.0}, Field2D{1.0}, Field2D{0.0}, Field2D{0.0},
+      Field2D{0.0}, Field2D{1.0}, Field2D{1.0}, Field2D{1.0}, Field2D{0.0},
+      Field2D{0.0}, Field2D{0.0}, Field2D{0.0}, Field2D{0.0});
+  px_mesh.setCoordinates(coords);
+  coords->setParallelTransform(std::make_unique<ParallelTransformIdentity>(px_mesh));
+  ASSERT_GT(px_mesh.xend, px_mesh.xstart); // The two edges must differ
+
+  // Positive temperature, different at the two x edges
+  Field3D temperature{1.0};
+  BOUT_FOR_SERIAL(i, temperature.getRegion("RGN_ALL")) {
+    temperature[i] = 1. + 0.4 * i.x() + 0.1 * SQ(i.y()) + 0.05 * i.z();
+  }
+
+  {
+    BraginskiiConduction face = this->makeLimitedComponent(0.2, true);
+    Options state = this->makeState(temperature);
+    face.declareAllSpecies({"test+"});
+    face.transform(state);
+
+    const Field3D kappa_face = state["species"]["test+"]["kappa_par"];
+    for (int y = px_mesh.ystart; y <= px_mesh.yend; y++) {
+      for (int z = 0; z < nz; z++) {
+        EXPECT_NE(kappa_face(px_mesh.xstart, y, z), kappa_face(px_mesh.xend, y, z));
+        EXPECT_EQ(kappa_face(px_mesh.xstart - 1, y, z), kappa_face(px_mesh.xend, y, z));
+        EXPECT_EQ(kappa_face(px_mesh.xend + 1, y, z), kappa_face(px_mesh.xstart, y, z));
+      }
+    }
+  }
+  bout::globals::mesh = fixture_mesh;
+}
+
 // TODO: Add tests for more types of collisions (e.g., electron-ion, charge-exchante, ion
 // neutral...)
